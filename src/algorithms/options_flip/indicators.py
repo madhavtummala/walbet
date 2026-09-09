@@ -5,9 +5,10 @@ codebase before; the strategy previously reasoned in raw percentages and in a me
 from the open, neither of which says how big a move is *for this symbol on this day*.
 
 **Everything here is a per-symbol, absolute measurement.** Nothing is ranked against a universe,
-so a two-symbol run and a forty-symbol run compute the same numbers -- which is the defect that
-``docs/rally-rotation-simplification.md`` diagnoses in a cross-sectional score, and the reason
-that algorithm's *features* port here while its ``base_scores`` does not.
+so a two-symbol run and a forty-symbol run compute the same numbers. Rally Rotation's own score
+is cross-sectional -- it answers "which of these is leading", which only means something relative
+to the rest of that run's universe -- so that algorithm's per-symbol *features* port here while
+its cross-sectional ``base_scores`` does not.
 """
 
 from __future__ import annotations
@@ -79,6 +80,34 @@ def opening_range(intraday_today: pd.DataFrame, minutes: int = 30) -> dict[str, 
     low = float(window["low"].astype(float).min())
     return {"high": high, "low": low, "width": max(high - low, 0.0),
             "close": float(window["close"].astype(float).iloc[-1])}
+
+
+def directional_volume(intraday_today: pd.DataFrame) -> dict[str, float]:
+    """Today's volume, split by whether each bar closed above or below its own open.
+
+    No tick data exists to classify individual prints as buyer- or seller-initiated, so this
+    reads the bar itself as the vote: a 5-minute bar that closed above where it opened is
+    counted as buy volume, one that closed below as sell volume, and a flat bar counts toward
+    neither. Coarse next to a real tick rule (Lee-Ready and friends need trade-by-trade prints
+    this codebase does not have), but it needs nothing beyond the OHLCV bars already loaded,
+    and it is a session-level read -- "is today buyer- or seller-heavy so far" -- not a
+    tick-timing one, so the coarseness costs less here than it would trying to call a fill.
+
+    ``imbalance`` is ``(buy - sell) / (buy + sell)``, in ``[-1, 1]``: positive means today's
+    volume has leaned toward bars that closed up.
+    """
+    empty = {"buy_volume": 0.0, "sell_volume": 0.0, "imbalance": 0.0}
+    if intraday_today is None or intraday_today.empty or "volume" not in intraday_today:
+        return empty
+    frame = intraday_today
+    opens = frame["open"].astype(float)
+    closes = frame["close"].astype(float)
+    volume = frame["volume"].astype(float)
+    buy = float(volume[closes > opens].sum())
+    sell = float(volume[closes < opens].sum())
+    total = buy + sell
+    imbalance = ((buy - sell) / total) if total > 0 else 0.0
+    return {"buy_volume": buy, "sell_volume": sell, "imbalance": imbalance}
 
 
 def moving_average(closes: pd.Series, window: int) -> float:
