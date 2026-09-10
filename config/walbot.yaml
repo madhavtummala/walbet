@@ -167,8 +167,8 @@ algorithms:
     macro_days: 20
   options_flip:
     stop_loss_pct: 0.5
-    max_hold_sessions: 6
-    target_delta: 0.8
+    max_hold_sessions: 5
+    target_delta: 0.75
     entry_reach: 0.4
     exit_reach: 0.35
     entry_patience: 2
@@ -184,14 +184,14 @@ algorithms:
     max_annual_volatility: 0.8
     plan:
       call:
-        amount: 2000
+        amount: 3425
         items:
         - symbol: IBIT
-          amount: 500
+          amount: 925
         - symbol: USO
           amount: 500
         - symbol: GLD
-          amount: 1000
+          amount: 2000
       put:
         amount: 0
         items: []
