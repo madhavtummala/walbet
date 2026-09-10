@@ -11,7 +11,7 @@ from src.connectors.market import alpaca as market_alpaca
 from src.connectors.market import finnhub as market_finnhub
 from src.connectors.market import schwab as market_schwab
 from src.connectors.news import stocktwits as news_stocktwits
-from src.connectors.cache import INTRADAY_CACHE_TTL_SECONDS, _fresh_cached_bars
+from src.connectors.cache import cache_is_current
 from src.connectors.frames import normalize_intraday_frame
 from src.connectors.grid import bars_for_minutes, resolve_bar_minutes
 from src.core.config import Config
@@ -266,7 +266,7 @@ def test_normalize_intraday_frame_preserves_adjusted_close() -> None:
     assert bars["adjusted_close"].tolist() == [99.75, 101.5]
 
 
-def test_fresh_cached_bars_rejects_stale_eod_rows() -> None:
+def test_a_daily_cache_missing_completed_sessions_is_not_current() -> None:
     bars = pd.DataFrame(
         {
             "timestamp": pd.to_datetime(["2026-06-04T23:00:00-05:00"]),
@@ -278,13 +278,12 @@ def test_fresh_cached_bars_rejects_stale_eod_rows() -> None:
         }
     )
 
-    fresh = _fresh_cached_bars(
+    # Eight days later, several sessions have closed and are not in the cache.
+    assert not cache_is_current(
         bars,
         connectors.DAILY_INTERVAL_MINUTES,
         now=pd.Timestamp("2026-06-12T12:00:00-05:00"),
     )
-
-    assert fresh.empty
 
 
 def test_fetch_alpaca_eod_bars_fetches_when_duckdb_rows_are_stale(monkeypatch) -> None:
@@ -369,7 +368,9 @@ def test_fetch_finnhub_intraday_bars_parses_and_caches_candles(monkeypatch) -> N
     # Written straight to the bar store, keyed by provider and resolution -- no payload cache
     # in front of it any more.
     assert saved["args"][:3] == ("finnhub", "SPY", 30)
-    assert saved["kwargs"]["ttl_seconds"] == INTRADAY_CACHE_TTL_SECONDS
+    # No TTL is passed, and none should be: a printed bar is immutable, so it has nothing to
+    # expire into. The argument used to be threaded here and ignored by the store.
+    assert "ttl_seconds" not in saved["kwargs"]
 
 
 def test_fetch_market_history_uses_yfinance_provider(monkeypatch) -> None:
@@ -382,7 +383,6 @@ def test_fetch_market_history_uses_yfinance_provider(monkeypatch) -> None:
 
     use_provider(monkeypatch, "yfinance", bars=fake_yfinance)
     # The window is fully covered by the provider, so no cached back-fill is consulted.
-    monkeypatch.setattr(connectors, "_extend_with_cached_history", lambda bars, *_args: bars)
 
     bars = connectors.fetch_market_history(["SPY"], config, lookback_minutes=1170, force_refresh=True)
 
@@ -875,3 +875,250 @@ def test_an_expired_cache_row_is_a_miss_not_a_hit(tmp_path) -> None:
     # Same row, written with a TTL that has already elapsed.
     save_cached_payload("market_data", "schwab", "IBIT", {"price": 36.15}, -1, db_path=db)
     assert load_cached_payload("market_data", "schwab", "IBIT", db_path=db) is None
+
+
+# --------------------------------------------------------------------------------------
+# Out-of-hours bar freshness. The session is 6.5 of 24 hours, so most runs are out of it.
+# --------------------------------------------------------------------------------------
+
+
+def _bars_ending(moment: str) -> pd.DataFrame:
+    from src.core.interfaces import MARKET_TZ
+
+    end = pd.Timestamp(moment, tz=MARKET_TZ).tz_convert("UTC")
+    return pd.DataFrame(
+        {"timestamp": [end - pd.Timedelta(minutes=5), end], "close": [1.0, 1.0]}
+    )
+
+
+def _is_fresh(now: str, latest: str) -> bool:
+    from src.core.interfaces import MARKET_TZ
+
+    now_ts = pd.Timestamp(now, tz=MARKET_TZ).tz_convert("UTC")
+    return cache_is_current(_bars_ending(latest), 5, now=now_ts)
+
+
+def test_a_complete_out_of_hours_cache_is_not_refetched() -> None:
+    """No intraday bar can print between the close and the next open, so a cache holding
+    everything up to the last close is complete rather than stale.
+
+    The age rule alone expired yesterday's 16:00 bar fifteen minutes after it printed, so every
+    out-of-hours run re-downloaded the whole window -- 15,000 bars a symbol, forty seconds --
+    and returned exactly what was already stored. That is what made a signals refresh time out.
+    """
+    assert _is_fresh("2026-09-10 08:18", "2026-09-09 16:00")   # pre-market
+    assert _is_fresh("2026-09-10 18:00", "2026-09-10 16:00")   # after the close
+    assert _is_fresh("2026-09-12 10:00", "2026-09-11 16:00")   # Saturday
+    assert _is_fresh("2026-09-14 08:00", "2026-09-11 16:00")   # Monday before the open
+
+
+def test_in_session_the_cache_is_current_only_up_to_the_last_completed_bar() -> None:
+    """Inside the session the frontier advances one grid step at a time, and the cache is
+    behind the moment a bar completes without it.
+
+    Stricter than the TTL it replaced -- which served a five-minute-old bar as fresh for a
+    further ten minutes -- and cheaper, because being behind now costs the missing bars rather
+    than the whole window.
+    """
+    # Sitting exactly on the frontier: the 11:00 bar is held, nothing newer can exist.
+    assert _is_fresh("2026-09-10 11:00", "2026-09-10 11:00")
+    # One bar behind: the 11:00 bar completed and is not held, so it is fetched.
+    assert not _is_fresh("2026-09-10 11:00", "2026-09-10 10:55")
+    # Mid-bar, holding the last completed one: current until 11:05 completes.
+    assert _is_fresh("2026-09-10 11:03", "2026-09-10 11:00")
+    # In session with nothing from today: the previous close is not the whole story any more.
+    assert not _is_fresh("2026-09-10 09:35", "2026-09-09 16:00")
+    # Out of session, but missing the session that has since completed.
+    assert not _is_fresh("2026-09-10 18:00", "2026-09-09 16:00")
+
+
+def test_a_live_option_contract_survives_a_prune() -> None:
+    """Options Flip predicts its exit band from the contract's *own* price history, so pruning
+    a live contract silently drops it back to the underlying-delta translation.
+
+    No OSI symbol is in the tradable universe, so the universe filter alone deleted every
+    option contract -- live ones included.
+    """
+    from datetime import date
+
+    from src.data.cache_prune import _contract_is_live
+
+    assert _contract_is_live("USO260916C00142000", date(2026, 9, 10))
+    assert _contract_is_live("USO260916C00142000", date(2026, 9, 16))   # expiry day still trades
+
+
+def test_an_expired_contract_is_dead_weight_and_can_go() -> None:
+    """Once a contract expires nobody can trade it and no run will ask for it again, so its
+    rows only accumulate -- one contract at a time, every expiry."""
+    from datetime import date
+
+    from src.data.cache_prune import _contract_is_live
+
+    assert not _contract_is_live("USO260916C00142000", date(2026, 9, 17))
+
+
+def test_a_symbol_we_cannot_parse_is_never_deleted() -> None:
+    """Refusing to delete what cannot be identified is the recoverable direction: bars older
+    than the API will re-serve cannot be fetched back."""
+    from datetime import date
+
+    from src.data.cache_prune import _contract_is_live
+
+    assert _contract_is_live("NOT_AN_OSI_SYMBOL", date(2026, 9, 17))
+
+
+# --------------------------------------------------------------------------------------
+# Range-addressed reads. A bar is immutable, so the only question is which ones are held.
+# --------------------------------------------------------------------------------------
+
+
+def _window(start: str, end: str):
+    from src.core.interfaces import MARKET_TZ
+
+    return (
+        pd.Timestamp(start, tz=MARKET_TZ).tz_convert("UTC"),
+        pd.Timestamp(end, tz=MARKET_TZ).tz_convert("UTC"),
+    )
+
+
+def _gaps(held_end: str | None, start: str, end: str, now: str, **kwargs):
+    from src.connectors.cache import missing_ranges
+    from src.core.interfaces import MARKET_TZ
+
+    window_start, window_end = _window(start, end)
+    held = (
+        pd.DataFrame({"timestamp": pd.date_range(
+            end=pd.Timestamp(held_end, tz=MARKET_TZ).tz_convert("UTC"), periods=78, freq="5min")})
+        if held_end else pd.DataFrame()
+    )
+    return missing_ranges(
+        held, window_start=window_start, window_end=window_end, interval_minutes=5,
+        now=pd.Timestamp(now, tz=MARKET_TZ).tz_convert("UTC"), **kwargs,
+    )
+
+
+def test_an_interior_gap_is_a_holiday_and_is_never_refetched() -> None:
+    """Anything bracketed by cached bars was inside a span already fetched, so an empty day
+    there is a day the market was shut -- measured against the live cache, all nine of GLD's
+    interior gaps across 195 sessions are holidays. Requesting them would return nothing, on
+    every call, forever."""
+    # One session held, and the window sits entirely inside it: nothing to fetch.
+    assert _gaps("2026-09-09 16:00", "2026-09-09 10:00", "2026-09-09 16:00", "2026-09-10 08:18") == []
+
+
+def test_history_older_than_the_cache_is_one_leading_request() -> None:
+    gaps = _gaps("2026-09-09 16:00", "2026-05-20 09:30", "2026-09-09 16:00", "2026-09-10 08:18")
+
+    assert len(gaps) == 1
+    assert gaps[0][0] == _window("2026-05-20 09:30", "x 00:00".replace("x", "2026-05-20"))[0]
+
+
+def test_a_known_provider_horizon_stops_the_leading_re_probe() -> None:
+    """A provider's history is finite -- Schwab serves 259 days -- so a window reaching past it
+    has a permanent leading gap. Remembering the horizon is what stops every call paying to
+    rediscover it."""
+    from src.core.interfaces import MARKET_TZ
+
+    horizon = pd.Timestamp("2026-09-09 09:30", tz=MARKET_TZ).tz_convert("UTC")
+    gaps = _gaps(
+        "2026-09-09 16:00", "2026-05-20 09:30", "2026-09-09 16:00", "2026-09-10 08:18",
+        earliest_available=horizon,
+    )
+
+    assert gaps == []
+
+
+def test_a_cold_cache_is_one_request_for_the_whole_window() -> None:
+    gaps = _gaps(None, "2026-09-09 09:30", "2026-09-09 16:00", "2026-09-10 08:18")
+
+    assert len(gaps) == 1
+
+
+# --------------------------------------------------------------------------------------
+# Option-contract history. A contract's printed bar is as immutable as an equity's.
+# --------------------------------------------------------------------------------------
+
+
+def test_option_contract_history_is_served_from_the_store(monkeypatch) -> None:
+    """It used to re-read its whole window every run, on a five-minute cron, bypassing the bar
+    store entirely -- the same fixed history downloaded again every time.
+
+    A contract's printed bar is as immutable as an equity's, so the first call stores it and
+    the second is answered without touching the provider.
+    """
+    from src.connectors.market import schwab_options
+
+    from src.connectors.cache import last_complete_bar_end
+
+    stored: dict[str, pd.DataFrame] = {}
+    calls: list[dict] = []
+    # Ending at the frontier, so a complete cache really is complete. Bars stopping short of it
+    # are correctly refetched -- that is the gap logic, not a cache miss.
+    base = last_complete_bar_end(5) - pd.Timedelta(minutes=10)
+
+    monkeypatch.setattr(schwab_options, "_schwab_token", lambda *_a, **_kw: "token")
+    monkeypatch.setattr(
+        "src.connectors.cache._read_duckdb_bars",
+        lambda provider, symbol, grid, **kw: stored.get(symbol, pd.DataFrame()),
+    )
+    monkeypatch.setattr(
+        "src.connectors.cache._write_duckdb_bars",
+        lambda provider, symbol, grid, frame: stored.__setitem__(symbol, frame),
+    )
+
+    def fake_request(*_args, **kwargs):
+        calls.append(kwargs)
+        return {"candles": [
+            {"datetime": int((base + pd.Timedelta(minutes=5 * i)).timestamp() * 1000),
+             "open": 1.0, "high": 1.1, "low": 0.9, "close": 1.0 + i / 10, "volume": 10}
+            for i in range(3)
+        ]}
+
+    monkeypatch.setattr(schwab_options, "_request_json", fake_request)
+
+    osi = "USO260916C00142000"
+    first = schwab_options.fetch_option_price_history(Config(), osi)
+    assert not first.empty and len(calls) == 1, "the first call fetches and stores"
+
+    second = schwab_options.fetch_option_price_history(Config(), osi)
+    assert not second.empty, "the second call still answers"
+    assert len(calls) == 1, "and does it without touching the provider again"
+
+
+def test_schwab_is_asked_for_an_option_in_its_own_spelling() -> None:
+    """Alpaca reports a position as ``USO260916C00142000``; Schwab wants the root padded to six.
+
+    Asking Schwab for the unpadded form returns an empty result rather than an error, so a
+    contract held at one broker and priced at another had no quote and no history, and nothing
+    reported a fault -- the mark fell through to whatever the cache last held and the band fell
+    back to translating the underlying through delta.
+    """
+    from src.connectors.market.schwab_osi import schwab_osi
+
+    assert schwab_osi("USO260916C00142000") == "USO   260916C00142000"
+    assert schwab_osi("USO   260916C00142000") == "USO   260916C00142000"
+    assert schwab_osi("AAPL260116C00150000") == "AAPL  260116C00150000"
+    # An ordinary ticker is not ours to rewrite.
+    assert schwab_osi("SPY") == "SPY"
+
+
+def test_an_option_quote_is_keyed_back_to_the_symbol_that_was_asked_for(monkeypatch) -> None:
+    """Requested in Schwab's spelling, returned in the caller's -- which is the one the
+    positions map uses, and the one every downstream lookup does."""
+    from src.connectors.market import schwab as market_schwab
+
+    asked: dict = {}
+
+    def fake_request(provider, category, url, params=None, headers=None):
+        asked.update(params or {})
+        return {"USO   260916C00142000": {"quote": {"lastPrice": 13.0}}}
+
+    monkeypatch.setattr(market_schwab, "_request_json", fake_request)
+    config = Config(
+        data_source_configs={"market_data": {"providers": {"schwab": {"access_token": "token"}}}}
+    )
+
+    quotes = market_schwab.Schwab(config).fetch_price(["USO260916C00142000"])
+
+    assert asked["symbols"] == "USO   260916C00142000", "asked in Schwab's spelling"
+    assert quotes["USO260916C00142000"]["price"] == 13.0, "answered in the caller's"

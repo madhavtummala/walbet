@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any
 
 import pandas as pd
@@ -16,18 +16,13 @@ from ..data.provider_cache import (
 
 logger = logging.getLogger(__name__)
 
-# Providers are declared in ``registry`` and imported on first use. Market data resolves to a
-# ``MarketDataProvider`` class that brings its own read-through cache; news is still a plain
-# fetcher dict, because a headline fetch has no bar store to read through to.
+# Providers are declared in ``registry`` and imported on first use.
 from .registry import (  # noqa: E402
     MARKET_DATA,
     NEWS_FETCHER_REGISTRY as NEWS_FETCHERS,
     market_provider,
 )
 
-# The shared plumbing, from the module that owns each piece. ``service`` used to re-export all
-# forty of these names so that callers could reach them through the dispatcher; twenty-eight of
-# those were unused here, which made the wall a second, drifting description of the toolkit.
 from .cache import (  # noqa: E402
     _news_cache_key,
     _read_duckdb_sentiment,
@@ -62,11 +57,9 @@ def _run_provider_fallback(
 ) -> dict[str, pd.DataFrame]:
     """Walk the provider order, keeping the best result *per symbol*.
 
-    Per symbol rather than per batch: a provider that answered for twelve of fourteen symbols
-    used to win the whole request, and the two it had nothing for were simply returned empty
-    -- no fallback, no error, and downstream they read as a symbol with no history rather
-    than one nobody asked properly. Later providers now fill only what is still missing, and
-    the walk stops as soon as every symbol is covered.
+    Per symbol rather than per batch, so a provider that answers for only some symbols doesn't
+    win the whole request and leave the rest empty; later providers fill only what is still
+    missing, and the walk stops once every symbol is covered.
     """
     resolved: dict[str, pd.DataFrame] = {}
     wanted = [symbol.upper() for symbol in symbols]
@@ -81,7 +74,7 @@ def _run_provider_fallback(
         next_provider = next((item for item in providers[index + 1 :] if item in fetchers), "")
         try:
             bars = fetchers[provider_name]()
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - one provider must not end the walk
             log = logger.info if next_provider else logger.warning
             log("%s market data provider %s failed%s: %s", label, provider_name, _fallback_suffix(next_provider), exc)
             continue
@@ -115,11 +108,8 @@ def _run_provider_fallback(
 def _bound(providers: list[str], config: Config, call: str, **kwargs):
     """``{provider: thunk}`` for each named provider, bound to one method call.
 
-    This used to inspect every fetcher's signature and hand it only the keyword arguments it
-    declared, because providers were loose functions with different parameters -- only Alpaca
-    wanted a ``data_client``, and a new provider would want neither that nor anything else this
-    module knew about. One method signature on ``MarketDataProvider`` makes that unnecessary:
-    ``**extra`` absorbs whatever a particular vendor needs.
+    Every provider shares one method signature (``**extra`` absorbs whatever a vendor needs),
+    so this needs no per-provider argument inspection.
     """
     def bind(name: str):
         def run():
@@ -178,53 +168,20 @@ def fetch_market_history(
     fine = _run_provider_fallback(
         symbols, providers, fetchers, config, category=INTRADAY_MARKET_CATEGORY, label="History"
     )
-    if start_date is not None or end_date is not None:
-        # An explicit range is a cache-warming request for one grid, not a signal window.
-        return fine
-    return _extend_with_cached_history(fine, lookback_minutes, requested_minutes)
-
-
-def _extend_with_cached_history(
-    fine_bars: dict[str, pd.DataFrame],
-    lookback_minutes: int,
-    requested_minutes: int,
-) -> dict[str, pd.DataFrame]:
-    """Back-fill each symbol's window from coarser cached bars where the fine ones run out.
-
-    This is what makes a minute-stated horizon honest across the board: a 4800-minute lookback
-    is roughly twelve sessions, which the intraday cache reaches once it has been running, but
-    a fresh deployment or a long-horizon knob would otherwise score every symbol flat. Daily
-    bars answer the far end of the window perfectly well for a return measured in minutes.
-    """
-    from ..data.bars import coverage_minutes
-    from ..data.bars import read_history
-
-    end = datetime.now(timezone.utc)
-    extended: dict[str, pd.DataFrame] = {}
-    for symbol, bars in fine_bars.items():
-        if not bars.empty and coverage_minutes(bars) >= lookback_minutes:
-            extended[symbol] = bars
-            continue
-        try:
-            blended = read_history(symbol, lookback_minutes=lookback_minutes, end=end)
-        except Exception as exc:
-            logger.warning("Cached history read failed for %s; using fine bars alone: %s", symbol, exc)
-            extended[symbol] = bars
-            continue
-        if blended.empty:
-            extended[symbol] = bars
-            continue
-        if not bars.empty:
-            work = bars.copy()
-            if "interval_minutes" not in work:
-                work["interval_minutes"] = int(requested_minutes)
-            blended = pd.concat([blended, work], ignore_index=True)
-        extended[symbol] = (
-            blended.sort_values("timestamp")
-            .drop_duplicates(subset=["timestamp"], keep="last")
-            .reset_index(drop=True)
-        )
-    return extended
+    # Returned at the resolution that was asked for, short if that is all there is.
+    #
+    # This used to back-fill a short window from *daily* bars, which was compensating for a
+    # coverage bug rather than for missing history: the cache was consulted only for whether it
+    # was current, never for whether it reached the start of the window, so a short cache was
+    # served as complete and the blend papered over it. The fetch fills the window properly now.
+    #
+    # And the substitution was not harmless. ``excursion_samples`` buckets bars by minute-of-day
+    # and never looks at ``interval_minutes``, so a daily bar blended into a five-minute series
+    # is counted as an intraday observation carrying a whole session's range -- which is what
+    # the dip and rebound quantiles are learned from. A too-wide level model reads as a market
+    # fact rather than a data gap. Callers that genuinely want a blended horizon ask
+    # ``read_history`` for one directly; the replay does.
+    return fine
 
 
 def fetch_eod_market_bars(

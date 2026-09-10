@@ -12,7 +12,7 @@ from datetime import date
 import pandas as pd
 import pytest
 
-from src.algorithms.options_flip.config import OptionsFlipConfig
+from src.algorithms.options_flip.config import ENTRY_MAX_REPRICE_PCT, OptionsFlipConfig
 from src.algorithms.options_flip.contracts import affordable_contracts, select_contract
 from src.algorithms.options_flip.indicators import (
     average_true_range,
@@ -68,7 +68,8 @@ def cfg(**kwargs) -> OptionsFlipConfig:
     # matches them rather than tracking the deployed default, which is a tuning decision and not
     # what any of these assertions are about.
     kwargs.setdefault("target_delta", 0.45)
-    return OptionsFlipConfig(symbols=["QQQM"], **kwargs)
+    # No ``symbols`` argument: which symbols trade is the board's statement now, not a knob.
+    return OptionsFlipConfig(**kwargs)
 
 
 def session(**kwargs) -> dict:
@@ -217,21 +218,6 @@ class TestContractSelection:
         best, _candidate, _checks = select_contract(puts, direction=PUT, as_of=date(2026, 2, 1), config=cfg())
         assert best is not None and best.osi_symbol == "P1"
 
-    def test_the_notional_cap_alone_decides_the_contract_count(self) -> None:
-        """Size is one decision, stated in dollars. Whole contracts, and the cap is never exceeded."""
-        rich = contract(ask=6.00)
-        assert affordable_contracts(rich, cfg(max_notional_per_trade=1000)) == 1
-        # contracts_per_trade is the unit; the cap only ever trims it.
-        assert affordable_contracts(rich, cfg(max_notional_per_trade=2000)) == 1
-        assert affordable_contracts(rich, cfg(max_notional_per_trade=2000,
-                                              contracts_per_trade=3)) == 3
-        # A cap of zero means no cap, so an expensive underlying is priced in rather than out.
-        assert affordable_contracts(rich, cfg(max_notional_per_trade=0,
-                                              contracts_per_trade=2)) == 2
-        # A premium the budget cannot cover buys nothing rather than rounding up to one.
-        assert affordable_contracts(rich, cfg(max_notional_per_trade=500)) == 0
-
-
 # ── the state machine ────────────────────────────────────────────────────────
 
 
@@ -301,6 +287,29 @@ class TestLifecycle:
         """
         late = self.bidding(entry_target=99.9, session=session(fraction_remaining=0.02))
         assert late.orders[0].request.limit_price <= contract().midpoint
+
+    def test_a_thin_contracts_jumpy_quote_does_not_move_the_bid_in_one_step(self) -> None:
+        """ENTRY_MAX_REPRICE_PCT caps how far one run can move the resting bid, independent of
+        entry_patience -- verified live on USO, where the ratchet's own given_up moved by 0.01
+        between two runs while the resting bid jumped $2.20, which given_up cannot explain; the
+        contract's own thinly-traded quote had jumped instead."""
+        # Late in the session, given_up is close to 1 -- without a cap this would walk almost
+        # all the way to the $2.05 mid in one step from the $1.00 previous bid.
+        late = self.bidding(
+            memory={"bid": 1.00}, entry_target=99.9, session=session(fraction_remaining=0.02),
+        )
+        max_step = 1.00 * ENTRY_MAX_REPRICE_PCT
+        assert float(late.orders[0].request.limit_price) <= 1.00 + max_step + 1e-9
+
+    def test_the_reprice_cap_never_overrides_the_never_above_mid_rule(self) -> None:
+        """The step cap could in principle push the price up to its ceiling even when the mid
+        sits below that -- re-asserting the mid cap after the clamp is what this guards."""
+        cheap_contract = contract(bid=1.00, ask=1.02, mark=1.01)
+        outcome = self.bidding(
+            memory={"bid": 0.90}, contract=cheap_contract, entry_target=99.9,
+            session=session(fraction_remaining=0.02),
+        )
+        assert float(outcome.orders[0].request.limit_price) <= cheap_contract.midpoint
 
     def test_never_bids_through_the_offer(self) -> None:
         # Target at the market, so the translated price is the mark -- still under the offer.
@@ -468,12 +477,19 @@ class TestStrikeSelection:
         assert best is not None and best.strike == 88.0
 
     def test_the_chosen_contract_reports_what_decided_it(self) -> None:
-        _b, _c, checks = select_contract(
+        """Delta and the liquidity the tie was broken on, on the contract itself.
+
+        These used to be a "Contract chosen" reading beside the deck's Contract column, which
+        already named the strike, expiry and delta -- three of its five fields repeated on a
+        second line. The two it alone carried moved onto that column instead.
+        """
+        best, _c, checks = select_contract(
             self.chain(), direction=CALL, as_of=date(2026, 2, 1), config=cfg()
         )
-        chosen = next(c for c in checks if c.label == "Contract chosen")
-        # Delta, and the liquidity the tie was broken on -- the three inputs to the ranking.
-        assert "delta" in chosen.value and "vol" in chosen.value and "OI" in chosen.value
+
+        assert best is not None
+        assert best.open_interest > 0 and best.spread_pct > 0
+        assert not any(c.label == "Contract chosen" for c in checks), "it repeated the column"
 
     def test_the_target_moves_the_strike(self) -> None:
         best, _c, _k = select_contract(
@@ -770,7 +786,7 @@ class TestStopDisabled:
         outcome = self._held(stop_loss_pct=0.0)
         stop_check = next(c for c in outcome.checks if c.label == "Protective stop")
         assert "loss cap" in stop_check.value
-        assert "deadline" in (stop_check.limit or "")
+        assert "deadline" in stop_check.value
 
 
 class TestExitTargetIsALevel:
@@ -1002,13 +1018,19 @@ class TestStopDisabledRecordsNoStop:
 
 
 def test_the_tune_page_order_matches_the_config_dataclass() -> None:
-    """The dashboard renders in the explainer's order, so a drift here reshuffles the form."""
+    """The dashboard renders in the explainer's order, so a drift here reshuffles the form.
+
+    ``plan`` is documented first and is deliberately not a dataclass field: the board is a
+    nested structure living in the config section, exactly as Bursty DCA's is, so it cannot
+    ride on a flat dataclass of scalars. It is the headline control and reads first.
+    """
     from dataclasses import fields as _fields
     from src.algorithms.explainers import EXPLAINERS
 
     documented = list(EXPLAINERS["options_flip"]["parameters"])
+    assert documented[0] == "plan"
     declared = [f.name for f in _fields(OptionsFlipConfig())]
-    assert documented == declared
+    assert documented[1:] == declared
 
 
 def _option_bars(sessions: dict) -> pd.DataFrame:
@@ -1125,11 +1147,45 @@ class TestSellBand:
         assert outcome.state == HELD
         assert 2.40 < self._target(outcome) <= 3.00
 
-    def test_the_bull_gate_closed_and_the_position_reads_at_the_mark(self) -> None:
-        # `sell_ok=False` means "sell at the mark" -- the bracket asks the market's own price
-        # rather than a target the closed gate no longer endorses.
+    def test_a_single_closed_read_does_not_collapse_the_target(self) -> None:
+        """A gate reading closed for one run only takes one concession step -- the streak-driven
+        decay (see ``SELL_GATE_CONCESSION_RATE``) only reaches the mark after several consecutive
+        closed reads, so a brief flicker never prices the exit as if the gate had been closed all
+        along."""
         outcome = self.held(memory={"target": 3.00}, sell_ok=False)
-        assert self._target(outcome) == pytest.approx(2.40, abs=0.02)
+        assert 2.40 < self._target(outcome) < 3.00
+        assert outcome.memory["gate_failed_streak"] == 1
+
+    def test_the_bull_gate_closed_converges_gradually_once_confirmed(self) -> None:
+        """Converges toward the mark as the closed-read streak grows -- the same "converge
+        across what's left of the clock" mechanism the deadline uses, driven by consecutive
+        closed reads instead of the session's fraction remaining."""
+        memory = {"target": 3.00}
+        outcome = self.held(memory=memory, sell_ok=False)
+        # One run in: a step taken, nowhere near the mark yet.
+        assert 2.40 < self._target(outcome) < 3.00
+        memory = dict(outcome.memory)
+        # Each step closes a fixed *fraction* of the remaining gap (an exponential approach,
+        # not a linear one), so it only ever gets arbitrarily close, never exactly there --
+        # 40 more runs is comfortably enough to call that "converged" for this assertion.
+        for _ in range(40):
+            outcome = self.held(memory=memory, sell_ok=False)
+            memory = dict(outcome.memory)
+        assert self._target(outcome) == pytest.approx(2.40, abs=0.05)
+        assert outcome.memory["gate_failed_streak"] == 41
+
+    def test_a_reopened_gate_resumes_the_normal_ratchet_immediately(self) -> None:
+        """Once sell_ok is true again the streak (and the concession) resets to zero and the
+        ratchet resumes right away -- asking for more is never the risky direction, only giving
+        ground is, so there is nothing to debounce on the way back up."""
+        memory = {"target": 3.00}
+        outcome = self.held(memory=memory, sell_ok=False)
+        memory = dict(outcome.memory)
+        conceded = self._target(outcome)
+        assert 2.40 < conceded < 3.00
+        outcome = self.held(memory=memory, target_premium=3.00, sell_ok=True)
+        assert self._target(outcome) > 2.40
+        assert outcome.memory["gate_failed_streak"] == 0
 
     def test_a_target_at_or_below_the_mark_also_reads_at_the_mark(self) -> None:
         outcome = self.held(memory={"target": 3.00}, target_premium=2.20)
@@ -1140,3 +1196,380 @@ class TestSellBand:
         outcome = self.held(memory={"target": 2.50}, target_premium=None, sell_ok=True)
         target = self._target(outcome)
         assert target > 2.40  # a sane translation still reaches for a profit
+
+
+def test_a_held_position_prices_against_what_it_actually_cost() -> None:
+    """A limit buy fills at or below its price, so the order we placed is an upper bound on the
+    cost and never the cost itself.
+
+    The anchor used to be the bid, and ``fill_price`` was set to whatever the mark happened to
+    be on the first poll after the fill -- so the deck reported an unrealised P&L against a
+    price the account never paid, and the stop was struck off it too.
+    """
+    from src.algorithms.options_flip.algorithm import _refresh_held
+    from src.algorithms.options_flip.config import OptionsFlipConfig
+
+    osi = "GLD   260918C00400000"
+    bidding_memory = {
+        "state": "bidding", "contract": osi, "direction": "call",
+        "contracts": 1, "bid": 15.00, "stop": 10.0, "market_day": "2026-09-10",
+    }
+
+    class Context:
+        latest_prices = {osi: 15.40}   # the mark has moved since the fill
+        cost_basis = {osi: 14.80}      # what the broker says we actually paid
+
+    memory = _refresh_held(
+        dict(bidding_memory), osi, Context(), {"market_day": "2026-09-10"}, OptionsFlipConfig()
+    )
+
+    assert memory["fill_price"] == 14.80
+
+
+def test_a_held_position_falls_back_when_the_broker_reports_no_cost() -> None:
+    """A brokerage that cannot report a cost basis must still be tradable -- the position is
+    anchored to the mark, and that is worth a warning rather than silence."""
+    from src.algorithms.options_flip.algorithm import _refresh_held
+    from src.algorithms.options_flip.config import OptionsFlipConfig
+
+    osi = "GLD   260918C00400000"
+
+    class Context:
+        latest_prices = {osi: 15.40}
+        cost_basis: dict[str, float] = {}
+
+    memory = _refresh_held(
+        {"contract": osi, "bid": 15.00}, osi, Context(),
+        {"market_day": "2026-09-10"}, OptionsFlipConfig(),
+    )
+
+    assert memory["fill_price"] == 15.40
+
+
+def test_the_cost_basis_is_refreshed_rather_than_frozen() -> None:
+    """A partial fill or a second lot moves the average, so it is re-read every run instead of
+    being recorded once and kept."""
+    from src.algorithms.options_flip.algorithm import _refresh_held
+    from src.algorithms.options_flip.config import OptionsFlipConfig
+
+    osi = "GLD   260918C00400000"
+
+    class Context:
+        latest_prices = {osi: 15.40}
+        cost_basis = {osi: 15.10}      # averaged up by a second lot
+
+    memory = _refresh_held(
+        {"contract": osi, "fill_price": 14.80}, osi, Context(),
+        {"market_day": "2026-09-10"}, OptionsFlipConfig(),
+    )
+
+    assert memory["fill_price"] == 15.10
+
+
+# --------------------------------------------------------------------------------------
+# Per-symbol budgets. One global contract count meant a six-fold difference in money at
+# risk between a $17 premium and a $2.50 one -- a position-sizing decision nobody made.
+# --------------------------------------------------------------------------------------
+
+
+class _Quote:
+    def __init__(self, ask: float) -> None:
+        self.ask = ask
+        self.midpoint = ask
+
+
+def test_the_board_sizes_a_position_in_dollars() -> None:
+    """The budget is the loss cap -- a long option cannot lose more than its premium -- so the
+    same dollar figure means the same risk on a $17 premium and a $2.50 one."""
+    from src.algorithms.options_flip.config import OptionsFlipConfig
+    from src.algorithms.options_flip.contracts import affordable_contracts
+
+    config = OptionsFlipConfig()
+
+    assert affordable_contracts(_Quote(17.50), config, budget=3_500.0) == 2    # $3,500
+    assert affordable_contracts(_Quote(2.50), config, budget=3_500.0) == 14    # $3,500
+
+
+def test_a_budget_below_one_contract_opens_nothing() -> None:
+    """Rounded down, never up: a budget that cannot cover one contract is not a position."""
+    from src.algorithms.options_flip.config import OptionsFlipConfig
+    from src.algorithms.options_flip.contracts import affordable_contracts
+
+    assert affordable_contracts(_Quote(17.50), OptionsFlipConfig(), budget=1_000.0) == 0
+
+
+def test_a_symbol_absent_from_the_board_opens_nothing() -> None:
+    """No bubble, no position. The board is the whole statement of what may be traded, so
+    there is no global unit left for an unfunded symbol to fall back to."""
+    from src.algorithms.options_flip.config import OptionsFlipConfig, sanitize_plan, symbol_budget
+    from src.algorithms.options_flip.contracts import affordable_contracts
+
+    plan = sanitize_plan({"call": {"items": [{"symbol": "GLD", "amount": 3_500}]}}, {"GLD", "USO"})
+
+    assert symbol_budget(plan, "GLD", "call") == 3_500.0
+    assert symbol_budget(plan, "USO", "call") == 0.0
+    assert affordable_contracts(_Quote(8.00), OptionsFlipConfig(), budget=0.0) == 0
+
+
+def test_the_board_declares_call_and_put_buckets() -> None:
+    """The put bucket exists so adding puts is config rather than a new code path -- nothing
+    reads it until the level model and the regime gate are mirrored."""
+    from src.algorithms.options_flip.algorithm import OptionsFlipAlgorithm
+    from src.algorithms.options_flip.config import sanitize_plan
+
+    assert OptionsFlipAlgorithm.tune_buckets == ("call", "put")
+    assert set(sanitize_plan({}, {"GLD"})) == {"call", "put"}
+
+
+def test_editing_a_budget_invalidates_the_cached_signal_view() -> None:
+    """The board sizes every position, so a snapshot computed under the old amounts must not be
+    served for the new ones."""
+    from dataclasses import replace
+
+    from src.algorithms.options_flip.algorithm import OptionsFlipAlgorithm
+    from src.core.config import get_config
+
+    algorithm = OptionsFlipAlgorithm({})
+    base = get_config()
+    symbol = sorted(base.symbols)[0]
+
+    def with_budget(amount: float):
+        return replace(base, algorithm_configs={
+            **(base.algorithm_configs or {}),
+            "options_flip": {"plan": {"call": {"items": [{"symbol": symbol, "amount": amount}]}}},
+        })
+
+    assert algorithm.config_fingerprint(with_budget(3_500)) != algorithm.config_fingerprint(with_budget(1_000))
+
+
+def test_a_held_position_reprices_its_delta_as_the_underlying_moves() -> None:
+    """Delta is a property of where the underlying sits now, not of the trade.
+
+    A USO 142 call six days out is delta ~0.90 at spot 150 and ~0.10 at spot 134, so a delta
+    frozen at the fill overstates the target premium by 4% while the trade works and by nearly
+    400% once it has gone badly wrong -- asking an impossible price exactly when the position
+    should be conceding.
+    """
+    import pandas as pd
+
+    from src.algorithms.options_flip.algorithm import _refresh_held
+    from src.algorithms.options_flip.config import OptionsFlipConfig
+
+    osi = "USO   260916C00142000"
+
+    def context_at(spot: float):
+        closes = [spot * (1 + 0.01 * ((i % 5) - 2)) for i in range(40)]
+
+        class Context:
+            latest_prices = {osi: 7.20, "USO": spot}
+            cost_basis: dict[str, float] = {}
+            daily_bars_by_symbol = {"USO": pd.DataFrame({
+                "timestamp": pd.date_range("2026-07-01", periods=40, freq="B", tz="UTC"),
+                "close": closes, "open": closes, "high": closes, "low": closes,
+                "volume": [1_000] * 40,
+            })}
+
+        return Context()
+
+    session = {"market_day": "2026-09-10"}
+    config = OptionsFlipConfig()
+
+    deep = _refresh_held({"contract": osi, "fill_price": 8.85}, osi, context_at(150.0), session, config)
+    # Same stored memory, now well below the strike.
+    fallen = _refresh_held(dict(deep), osi, context_at(130.0), session, config)
+
+    assert deep["delta"] > 0.8, "deep in the money, delta near one"
+    assert fallen["delta"] < deep["delta"] / 2, "re-priced downward rather than carried from the fill"
+
+
+# --------------------------------------------------------------------------------------
+# What rests against an open position. Each of these left a real position unprotected.
+# --------------------------------------------------------------------------------------
+
+
+_OSI = "USO   260916C00142000"
+_SESSION = {"market_day": "2026-09-10", "fraction_remaining": 0.5}
+
+
+def _held_plan(memory: dict, contracts: int = 2, **kwargs):
+    from src.algorithms.options_flip.config import OptionsFlipConfig
+    from src.algorithms.options_flip.lifecycle import plan_symbol
+
+    return plan_symbol(
+        "USO", memory=dict(memory), held_contract=_OSI, direction="call", contract=None,
+        contracts=contracts, underlying_now=150.0, entry_target=0.0,
+        exit_target=kwargs.pop("exit_target", 160.0), checks=[],
+        config=OptionsFlipConfig(), session=_SESSION, **kwargs,
+    )
+
+
+def test_the_exit_is_sized_from_the_broker_not_from_remembered_intent() -> None:
+    """A partial fill, a hand-trimmed position or one opened elsewhere all leave the remembered
+    intent saying something the account does not hold.
+
+    An exit sized above the position is rejected outright, which leaves an open position with
+    no protection resting against it at all -- the worst of the available outcomes.
+    """
+    from src.algorithms.options_flip.algorithm import _held_quantities
+
+    assert _held_quantities({_OSI: 2.0}) == {"USO": 2}
+
+    plan = _held_plan(
+        {"contract": _OSI, "contracts": 5, "fill_price": 8.85, "delta": 0.9, "mark": 7.20},
+        contracts=2,
+    )
+
+    assert [order.request.quantity for order in plan.orders] == [2, 2]
+
+
+def test_a_run_that_cannot_price_the_contract_keeps_the_protection_resting() -> None:
+    """Resting nothing does not mean "leave things as they are".
+
+    The reconciler cancels every recorded order a run stops wanting, so a single missed quote
+    withdrew the live profit target *and* the protective stop from an open position and
+    re-placed them on the next fire. The last known prices are re-asserted instead, which the
+    reconciler reads as unchanged.
+    """
+    plan = _held_plan(
+        {"contract": _OSI, "contracts": 2, "fill_price": 8.85, "mark": 0.0,
+         "target": 15.22, "stop": 4.42},
+        exit_target=0.0,
+    )
+
+    resting = {order.key: (order.request.limit_price or order.request.stop_price)
+               for order in plan.orders}
+    assert resting == {"USO:target": 15.22, "USO:stop": 4.42}
+
+
+def test_the_stop_is_struck_off_what_the_position_cost() -> None:
+    """A limit buy fills at or below its price, so anchoring the stop to the entry *limit* put
+    the floor above where the configured percentage belongs and cut positions short of their
+    stated loss cap."""
+    plan = _held_plan(
+        {"contract": _OSI, "contracts": 2, "fill_price": 8.00, "bid": 10.00,
+         "stop": 5.00, "mark": 9.00, "delta": 0.9},
+    )
+
+    stops = [o.request.stop_price for o in plan.orders if o.request.order_type == "stop"]
+    assert stops == [4.00], "50% below the $8.00 fill, not the $10.00 bid"
+
+
+def test_every_gate_that_can_refuse_a_trade_is_in_the_formula() -> None:
+    """The deck shows fourteen checks that can block, and the Tune formula should account for
+    all of them.
+
+    It described the signal half -- trend, regime, levels, the greeks -- and omitted contract
+    selection entirely, so six gates could refuse a trade with nothing in the explanation
+    saying they existed. "Affordable" is one of them, and it was the blocking check on a live
+    row.
+    """
+    from src.algorithms.explainers import EXPLAINERS
+
+    formula = " ".join(EXPLAINERS["options_flip"]["formula"])
+    for knob in (
+        "min_trend_strength", "regime_fast_ma_days", "VWAP", "max_gap_down_atr",
+        "entry_reach", "exit_reach", "entry_cutoff_fraction", "min_profit_per_contract",
+        "max_annual_volatility", "min_dte", "target_delta", "min_open_interest",
+        "max_quote_age_seconds",
+    ):
+        assert knob in formula, f"{knob} gates a trade but the formula never mentions it"
+
+
+def test_only_a_real_requirement_goes_in_a_checks_limit() -> None:
+    """``Check.limit`` is "what it had to be", and the deck renders it as "needs {limit}".
+
+    Readings put explanatory prose there, so a check that refuses nothing rendered as
+    "needs reported, not gated" -- a requirement stated for something that requires nothing.
+    A note belongs in the value; only a gate carries a limit.
+    """
+    import ast
+    import pathlib
+
+    offenders = []
+    for path in pathlib.Path("src/algorithms/options_flip").glob("*.py"):
+        for node in ast.walk(ast.parse(path.read_text())):
+            if not (isinstance(node, ast.Call) and getattr(node.func, "id", "") == "Check"):
+                continue
+            kw = {k.arg: k.value for k in node.keywords}
+            limit = kw.get("limit")
+            if limit is None:
+                continue
+            if not isinstance(limit, (ast.Constant, ast.JoinedStr, ast.BinOp)):
+                continue  # a pass-through, not a literal this file controls
+            text = ast.unparse(limit)
+            # A requirement compares something. Prose does not -- and prose is what reads as
+            # nonsense once the deck prefixes it with "needs". A gate that passed may still
+            # restate the bar it cleared, which is worth showing.
+            if not any(token in text for token in (
+                "≥", "≤", ">", "<", "=", "within", "at least", "only", "never",
+                "placed at", "or recovering", "allowed",
+                # A noun phrase reads correctly after "needs": "needs a quote to size the
+                # bracket from", "needs daily bars to measure the trend against".
+                "a ", "an ", "the ",
+            )):
+                offenders.append(f"{path.name}: {text[:60]}")
+
+    assert not offenders, "a check's limit must read as a requirement: " + "; ".join(offenders)
+
+
+def test_a_check_that_can_refuse_nothing_is_not_a_gate() -> None:
+    """``blocking`` says what happened this run; ``gate`` says what the check is for.
+
+    The deck rendered both alike, so twelve gates read as eighteen -- a stricter strategy than
+    the one that runs. Readings stay on the row because two of them, the resting target and the
+    stop, are the most useful lines on a held position; they are just not hurdles.
+    """
+    import ast
+    import pathlib
+
+    wrong = []
+    for path in pathlib.Path("src/algorithms/options_flip").glob("*.py"):
+        for node in ast.walk(ast.parse(path.read_text())):
+            if not (isinstance(node, ast.Call) and getattr(node.func, "id", "") == "Check"):
+                continue
+            kw = {k.arg: k.value for k in node.keywords}
+            blocking, gate = kw.get("blocking"), kw.get("gate")
+            can_block = blocking is not None and not (
+                isinstance(blocking, ast.Constant) and not blocking.value
+            )
+            declared_reading = isinstance(gate, ast.Constant) and gate.value is False
+            if can_block and declared_reading:
+                wrong.append(f"{path.name}:{node.lineno} blocks but declares gate=False")
+
+    assert not wrong, "; ".join(wrong)
+
+
+def test_the_deck_shows_gates_and_nothing_else() -> None:
+    """A reading is measured alongside the decision and never part of it, and every one worth
+    acting on is already a column -- the band, the contract, the stop.
+
+    They stay in the payload, where an agent or a debugging session can reach them; they are
+    just not a second list under the gates.
+    """
+    from pathlib import Path
+
+    app_js = (Path(__file__).resolve().parents[1] / "web/static/app.js").read_text()
+
+    # Both the pip strip and the expanded list filter to gates.
+    assert "const checks = allChecks.filter((check) => check.gate !== false);" in app_js
+    assert "const gates = row.checks.filter((check) => check.gate !== false);" in app_js
+    assert "Measured, not gated" not in app_js
+
+
+def test_the_contract_reads_the_same_whether_held_or_a_candidate() -> None:
+    """One builder for both, so a held position and a candidate cannot drift apart.
+
+    The candidate row briefly carried open interest and the quoted spread as well. Those are
+    what the "Liquid enough to trade" gate measures, and the panel already reports both against
+    their thresholds -- on the row they repeated the measurement without the bar it had to clear.
+    """
+    from datetime import date
+
+    from src.algorithms.options_flip.algorithm import _contract_label, _held_contract_label
+
+    candidate = _contract_label(385.0, "call", date(2026, 9, 25), 0.77)
+    held = _held_contract_label({"contract": "GLD   260925C00385000", "delta": 0.77})
+
+    assert candidate == held == "$385 call · 25 Sep · delta +0.77"
+    for absent in ("OI", "wide", "15d"):
+        assert absent not in candidate

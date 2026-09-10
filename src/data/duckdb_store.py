@@ -230,10 +230,15 @@ class _PooledConnection:
     the ``_read_only`` flag.
     """
 
-    __slots__ = ("_cursor", "_handle", "_read_only")
+    __slots__ = ("_cursor", "_handle", "_read_only", "_registered")
 
     def __init__(self, cursor: Any, *, handle: "_Handle | None" = None, read_only: bool = False) -> None:
         self._cursor = cursor
+        #: Frames registered as queryable relations, kept so they can be re-registered if the
+        #: handle upgrades mid-statement. An upgrade swaps the cursor, and a registration
+        #: belongs to the cursor it was made on -- so a bulk INSERT ... SELECT that triggered
+        #: the upgrade would come back to a relation that no longer exists.
+        self._registered: dict[str, Any] = {}
         self._handle = handle
         self._read_only = read_only
 
@@ -257,6 +262,17 @@ class _PooledConnection:
                 self._handle.cursors -= 1
                 _IDLE.notify_all()
 
+    def register(self, name: str, frame: Any) -> Any:
+        self._registered[name] = frame
+        return self._cursor.register(name, frame)
+
+    def unregister(self, name: str) -> Any:
+        self._registered.pop(name, None)
+        try:
+            return self._cursor.unregister(name)
+        except Exception:  # pragma: no cover - unregistering an absent relation is not an error
+            return None
+
     def execute(self, *args: Any, **kwargs: Any) -> Any:
         return self._run("execute", *args, **kwargs)
 
@@ -277,6 +293,9 @@ class _PooledConnection:
             if self._handle is None or not self._handle.read_only or not _is_read_only_error(exc):
                 raise
             self._upgrade()
+            # The new cursor knows nothing of what was registered on the old one.
+            for name, frame in self._registered.items():
+                self._cursor.register(name, frame)
             return getattr(self._cursor, method)(*args, **kwargs)
 
     def _upgrade(self) -> None:
@@ -340,25 +359,15 @@ def connection_is_read_only(connection: Any) -> bool:
 def pooled_connections(db_path: str | None = None, *, read_only: bool = False):
     """Hold one connection open for the duration of a batch job.
 
-    Opening a connection costs ~3ms and ``initialize_schema`` another ~2ms -- six
-    ``CREATE TABLE IF NOT EXISTS`` statements, a migration check and an ``UPDATE``. That is
-    nothing once and ruinous per read, and a backtest issues thousands of reads, which made
-    the *connection* rather than the query the dominant cost of replaying an algorithm.
+    Opening a connection and running its schema migrations costs a few ms -- nothing once, but
+    ruinous across a backtest's thousands of reads. Deliberately opt-in: DuckDB permits only one
+    read-write process at a time, so holding a connection permanently would lock out the API
+    server, the MCP server and every CLI tool.
 
-    Deliberately opt-in rather than always on. DuckDB permits a single read-write process at a
-    time, so a permanently-held connection locks every other process out entirely -- the API
-    server would shut out the MCP server, the warmup job and every CLI tool. Measured, not
-    assumed: a second process attempting a read against a held connection fails outright with
-    "Conflicting lock is held". Short-lived connections are what lets those coexist, so the
-    default stays short-lived and only batch work opts in.
-
-    ``read_only=True`` asks for DuckDB read-only mode, which is a different bargain with the
-    file lock: other *processes* can open their own read-only connections while the batch runs.
-    Within this process the mode is shared, so a thread that does need to write upgrades the
-    handle instead of failing -- see :meth:`_PooledConnection.execute`.
-
-    Nesting is safe, and so is opening a scope on a path another thread already scoped: both
-    join the existing handle and only the last scope out closes it.
+    ``read_only=True`` lets other *processes* open their own read-only connections concurrently;
+    within this process a thread that needs to write upgrades the handle instead of failing (see
+    :meth:`_PooledConnection.execute`). Nesting is safe, and so is a second scope on a path
+    another thread already scoped -- both share the handle, and only the last one out closes it.
     """
     resolved = str(resolve_project_path(db_path or DUCKDB_STATE_PATH))
     with _IDLE:
@@ -724,9 +733,11 @@ def write_market_bars(
     interval_minutes: int,
     bars: pd.DataFrame,
     *,
-    ttl_seconds: int | None = None,
     db_path: str | None = None,
 ) -> int:
+    """Store bars permanently. There is no TTL: a printed bar is immutable, so it has nothing
+    to expire into. Retention is a separate, explicit decision -- see ``src/data/cache_prune``.
+    """
     normalized = _normalize_bars(bars)
     if normalized.empty:
         return 0
@@ -737,34 +748,54 @@ def write_market_bars(
     normalized = _drop_unclosed_bars(normalized, resolution)
     if normalized.empty:
         return 0
-    rows = []
-    for row in normalized.to_dict(orient="records"):
-        rows.append(
-            (
-                provider,
-                symbol.upper(),
-                resolution,
-                pd.Timestamp(row["timestamp"]).to_pydatetime(),
-                float(row["open"]),
-                float(row["high"]),
-                float(row["low"]),
-                float(row["close"]),
-                float(row["volume"]),
-                float(row.get("adjusted_close", row["close"])),
-                None,
-            )
-        )
+    # Written as one set-based statement over a registered frame rather than row by row.
+    # ``executemany`` issues a separate INSERT per bar, and DuckDB is columnar: 6,240 bars --
+    # one symbol's 80 sessions at five minutes -- took 13.9s that way against 1.2s to fetch
+    # them over the network, so storing history cost eleven times what downloading it did and
+    # was 92% of a signals refresh.
+    staged = pd.DataFrame({
+        "provider": provider,
+        "symbol": symbol.upper(),
+        "interval_minutes": resolution,
+        "timestamp": pd.to_datetime(normalized["timestamp"], utc=True),
+        "open": normalized["open"].astype(float),
+        "high": normalized["high"].astype(float),
+        "low": normalized["low"].astype(float),
+        "close": normalized["close"].astype(float),
+        "volume": normalized["volume"].astype(float),
+        "adjusted_close": (
+            normalized["adjusted_close"] if "adjusted_close" in normalized else normalized["close"]
+        ).astype(float),
+        "raw_json": None,
+    })
     with _connect(db_path) as connection:
-        connection.executemany(
-            """
-            INSERT OR REPLACE INTO market_bars
-                (provider, symbol, interval_minutes, timestamp, open, high, low, close, volume,
-                 adjusted_close, raw_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            rows,
-        )
-    return len(rows)
+        connection.register("incoming_market_bars", staged)
+        try:
+            connection.execute(
+                """
+                INSERT OR REPLACE INTO market_bars
+                    (provider, symbol, interval_minutes, timestamp, open, high, low, close,
+                     volume, adjusted_close, raw_json)
+                SELECT provider, symbol, interval_minutes, timestamp, open, high, low, close,
+                       volume, adjusted_close, raw_json
+                FROM incoming_market_bars
+                """
+            )
+        finally:
+            connection.unregister("incoming_market_bars")
+    return len(staged)
+
+
+def where_clause(clauses: list[str]) -> str:
+    """``"WHERE a AND b"``, or ``""`` when ``clauses`` is empty."""
+    return f"WHERE {' AND '.join(clauses)}" if clauses else ""
+
+
+def count_and_delete(connection: Any, table: str, where: str, params: list[Any]) -> int:
+    """Delete rows matching ``where``/``params`` from ``table``, returning how many were dropped."""
+    deleted = int(connection.execute(f"SELECT COUNT(*) FROM {table} {where}", params).fetchone()[0] or 0)
+    connection.execute(f"DELETE FROM {table} {where}", params)
+    return deleted
 
 
 def _market_bar_filters(
@@ -784,7 +815,7 @@ def _market_bar_filters(
     if interval_minutes is not None:
         clauses.append("interval_minutes = ?")
         params.append(int(interval_minutes))
-    return (f"WHERE {' AND '.join(clauses)}" if clauses else ""), params
+    return where_clause(clauses), params
 
 
 def clear_market_bars(
@@ -796,9 +827,7 @@ def clear_market_bars(
 ) -> int:
     where, params = _market_bar_filters(provider, symbols, interval_minutes)
     with _connect(db_path) as connection:
-        deleted = int(connection.execute(f"SELECT COUNT(*) FROM market_bars {where}", params).fetchone()[0] or 0)
-        connection.execute(f"DELETE FROM market_bars {where}", params)
-        return deleted
+        return count_and_delete(connection, "market_bars", where, params)
 
 
 def market_bars_summary(

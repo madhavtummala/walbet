@@ -1,11 +1,16 @@
 const SVG_NS = "http://www.w3.org/2000/svg";
-const BUCKET_NAMES = ["buy", "sell"];
-const MAX_AMOUNT = 2000;
+//: Fallback only. Which buckets a budget board splits its symbols across is the algorithm's
+//: own declaration -- DCA divides a month into buy and sell, Options Flip divides a
+//: per-position cap into call and put -- and it arrives on the config payload as
+//: ``tune_buckets``. This is what the board uses before that payload has loaded.
+const DEFAULT_BUCKET_NAMES = ["buy", "sell"];
+//: Fallbacks only -- the algorithm declares its own on the config payload. See boardSpec.
+const DEFAULT_MAX_AMOUNT = 2000;
 //: The algorithm declares which purpose-built editor its Tune screen needs, and the config
 //: payload carries the answer. This used to be a hardcoded list of "the DCA algorithms" here,
 //: which meant the frontend held an idea of an algorithm family that the backend did not.
 const BUDGETS_EDITOR = "budgets";
-const WHEEL_STEP = 25;
+const DEFAULT_WHEEL_STEP = 25;
 //: Vertical offset of a bubble's amount label from its centre. Shared so the typing caret
 //: lands on the number it is editing rather than near it.
 const AMOUNT_LABEL_DY = 14;
@@ -17,15 +22,11 @@ let BACKTEST_LABEL = "4M";
 //: this only lets you look at a different window without editing config.
 const BACKTEST_PERIOD_CHOICES = ["1m", "3m", "6m", "12m", "24m"];
 
-const ENABLED_COLORS = {
-  buy: "#024c4a",
-  sell: "#7a3800",
-};
-
-const DISABLED_COLORS = {
-  buy: "#668f8b",
-  sell: "#a36d3c",
-};
+//: Two bucket colours, by position rather than by name. The board serves any algorithm's
+//: buckets -- buy/sell for DCA, call/put for Options Flip -- so keying these on "buy" and
+//: "sell" made the second board render undefined fills.
+const ENABLED_COLORS = ["#024c4a", "#7a3800"];
+const DISABLED_COLORS = ["#668f8b", "#a36d3c"];
 
 const STRATEGIES = [
   {
@@ -239,17 +240,55 @@ function clamp(value, min, max) {
 // DCA is live when it is the selected algorithm and the algorithm bot is on -- the same
 // condition as any other strategy, now that it runs on the shared loop.
 function bucketColor(bucketName) {
-  return isDcaEnabled() ? ENABLED_COLORS[bucketName] : DISABLED_COLORS[bucketName];
+  const palette = isPlanStrategyEnabled() ? ENABLED_COLORS : DISABLED_COLORS;
+  return palette[Math.max(bucketNames().indexOf(bucketName), 0) % palette.length];
 }
 
 function bucketStrokeColor(bucketName) {
-  return shadeColor(bucketColor(bucketName), isDcaEnabled() ? -48 : -34);
+  return shadeColor(bucketColor(bucketName), isPlanStrategyEnabled() ? -48 : -34);
 }
 
 //: Which algorithm's plan the board is editing. Its plan is ordinary tuning living at
 //: algorithms.<id>.plan, so the board always edits exactly the algorithm whose page you are on.
 function planStrategyKey() {
   return state.planStrategy || DEFAULT_ALGORITHM_KEY;
+}
+
+//: Everything the board needs that differs between algorithms: which buckets to draw, what a
+//: bubble's number means, and how far it can be pushed. One component, declared per algorithm,
+//: so DCA's dollars-per-month and Options Flip's contracts-per-position share every pixel of
+//: rendering and gesture handling rather than being two boards that look alike.
+function boardSpec(strategyKey) {
+  const entry = state.algorithmConfigs[strategyKey || planStrategyKey()] || {};
+  return {
+    buckets: Array.isArray(entry.tune_buckets) && entry.tune_buckets.length
+      ? entry.tune_buckets : DEFAULT_BUCKET_NAMES,
+    unit: entry.tune_unit === "count" ? "count" : "currency",
+    max: Number(entry.tune_max_amount) > 0 ? Number(entry.tune_max_amount) : DEFAULT_MAX_AMOUNT,
+    step: Number(entry.tune_step) > 0 ? Number(entry.tune_step) : DEFAULT_WHEEL_STEP,
+    hint: entry.tune_budget_hint || "Dollars per month, per symbol",
+  };
+}
+
+//: This board's ceiling and scroll increment, and how one amount is written. ``count`` renders
+//: a plain integer with its unit; ``currency`` renders dollars.
+function maxAmount() { return boardSpec().max; }
+//: What a full-size bubble represents. The board's ceiling doubles as its drawing scale, so an
+//: algorithm sets that ceiling to a value it actually reaches -- one set far above them renders
+//: every real budget as a dot.
+function scaleAmount() { return boardSpec().max; }
+function wheelStep() { return boardSpec().step; }
+function amountLabel(value) {
+  const spec = boardSpec();
+  if (spec.unit !== "count") return money(value);
+  const whole = Math.round(Number(value) || 0);
+  return `${whole}\u00d7`;
+}
+
+//: The buckets the board should draw, for whichever algorithm's plan is open. Read from the
+//: loaded config so one board serves every budgets algorithm; falls back until it arrives.
+function bucketNames(strategyKey) {
+  return boardSpec(strategyKey).buckets;
 }
 
 //: Whether an algorithm wants the budget board, as reported by /api/algorithm-config. False
@@ -264,7 +303,7 @@ function currentPlan() {
   const config = state.algorithmConfigs[planStrategyKey()]?.config;
   if (!config) return null;
   if (!config.plan || typeof config.plan !== "object") config.plan = {};
-  BUCKET_NAMES.forEach((bucketName) => {
+  bucketNames().forEach((bucketName) => {
     if (!config.plan[bucketName] || typeof config.plan[bucketName] !== "object") {
       config.plan[bucketName] = { amount: 0, items: [] };
     }
@@ -282,7 +321,7 @@ function setBucketItems(bucketName, items) {
   if (!plan) return;
   plan[bucketName].items = items.map((item) => ({
     symbol: item.symbol,
-    amount: clamp(Number(item.amount || 0), 0, MAX_AMOUNT),
+    amount: clamp(Number(item.amount || 0), 0, maxAmount()),
   }));
   plan[bucketName].amount = plan[bucketName].items.reduce(
     (total, item) => total + Number(item.amount || 0),
@@ -295,7 +334,8 @@ function assignedSymbols(bucketName) {
 }
 
 function itemRadius(amount) {
-  return 18 + Math.sqrt(clamp(amount, 0, MAX_AMOUNT) / MAX_AMOUNT) * 24.4;
+  const scale = scaleAmount();
+  return 18 + Math.sqrt(clamp(amount, 0, scale) / scale) * 24.4;
 }
 
 function svgEl(tag, attrs = {}) {
@@ -321,24 +361,25 @@ function calculateLayout() {
   const baseR = stacked ? Math.min(width * 0.31, height * 0.17, 185) : Math.min(width * 0.18, height * 0.32, 257);
   const maxR = stacked ? Math.min(width * 0.38, height * 0.21, 229) : Math.min(width * 0.24, height * 0.39, 321);
 
-  state.layout = {
-    width,
-    height,
-    stacked,
-    buckets: stacked
-      ? {
-        buy: { cx: width / 2, cy: height * 0.27, r: baseR, baseR, maxR, label: "BUY" },
-        sell: { cx: width / 2, cy: height * 0.72, r: baseR, baseR, maxR, label: "SELL" },
-      }
-      : {
-        buy: { cx: width * 0.29, cy: height * 0.51, r: baseR, baseR, maxR, label: "BUY" },
-        sell: { cx: width * 0.71, cy: height * 0.51, r: baseR, baseR, maxR, label: "SELL" },
-      },
-  };
+  // Built from the declared buckets rather than from the literal keys buy/sell. Those keys
+  // were the reason a call/put board rendered nothing at all: every lookup below is
+  // ``buckets[name]``, and on Options Flip that resolved to undefined and threw.
+  const names = bucketNames();
+  const buckets = {};
+  names.forEach((name, index) => {
+    const fraction = names.length === 1 ? 0.5 : index / (names.length - 1);
+    // Two buckets sit at 0.27/0.72 stacked and 0.29/0.71 side by side, as before; the same
+    // span generalises to any count without special-casing two.
+    const along = 0.27 + fraction * 0.45;
+    buckets[name] = stacked
+      ? { cx: width / 2, cy: height * along, r: baseR, baseR, maxR, label: name.toUpperCase() }
+      : { cx: width * (0.29 + fraction * 0.42), cy: height * 0.51, r: baseR, baseR, maxR, label: name.toUpperCase() };
+  });
+  state.layout = { width, height, stacked, buckets };
 }
 
 function fitBucketRadii() {
-  BUCKET_NAMES.forEach((bucketName) => {
+  bucketNames().forEach((bucketName) => {
     const bucket = state.layout.buckets[bucketName];
     const areaRadius = Math.sqrt(
       bucketItems(bucketName).reduce((sum, item) => sum + (itemRadius(item.amount) + 12) ** 2, 0),
@@ -358,7 +399,9 @@ function pointFromPosition(position, bucket, radius) {
 function fallbackPosition(index, count, bucketName) {
   if (count <= 1) return { x: 0, y: 0 };
   const ring = Math.sqrt((index + 1) / (count + 1));
-  const angle = index * GOLDEN_ANGLE + (bucketName === "sell" ? 0.9 : 0);
+  // Offset the second bucket's spiral so two boards of the same size do not sit in identical
+  // arrangements. Keyed on position rather than on the name "sell", so it works for call/put.
+  const angle = index * GOLDEN_ANGLE + (bucketNames().indexOf(bucketName) === 1 ? 0.9 : 0);
   return {
     x: Math.cos(angle) * ring * 0.68,
     y: Math.sin(angle) * ring * 0.68,
@@ -385,7 +428,11 @@ function distance(point, bucket) {
 
 function nearestBucket(point) {
   const buckets = state.layout.buckets;
-  return distance(point, buckets.buy) <= distance(point, buckets.sell) ? "buy" : "sell";
+  // Whichever declared bucket the point is closest to. Named buckets were compared directly
+  // here, which silently returned "buy"/"sell" on a board drawing call and put.
+  return bucketNames().reduce((closest, name) =>
+    distance(point, buckets[name]) < distance(point, buckets[closest]) ? name : closest
+  );
 }
 
 function bucketAtPoint(point) {
@@ -447,7 +494,7 @@ function buildNodes() {
   // Nodes belong to the plan they were built from. Recorded so nothing can write one
   // algorithm's bubbles into another's plan -- see syncNodesToPlan.
   state.nodesStrategy = planStrategyKey();
-  BUCKET_NAMES.forEach((bucketName) => {
+  bucketNames().forEach((bucketName) => {
     const bucket = state.layout.buckets[bucketName];
     const items = bucketItems(bucketName);
     items.forEach((item, index) => {
@@ -461,7 +508,7 @@ function buildNodes() {
         id,
         symbol: item.symbol,
         name: item.name,
-        amount: clamp(Number(item.amount || 0), 0, MAX_AMOUNT),
+        amount: clamp(Number(item.amount || 0), 0, maxAmount()),
         bucketName,
         targetBucket: bucketName,
         radius,
@@ -480,7 +527,7 @@ function syncNodeToPlan(node) {
   const clamped = clampPointToBucket({ x: node.x, y: node.y }, node.bucketName, node.radius);
   node.x = clamped.x;
   node.y = clamped.y;
-  item.amount = clamp(node.amount, 0, MAX_AMOUNT);
+  item.amount = clamp(node.amount, 0, maxAmount());
 }
 
 function syncNodesToPlan() {
@@ -491,13 +538,13 @@ function syncNodesToPlan() {
   // there is nothing here worth carrying across.
   if (state.nodesStrategy !== planStrategyKey()) return;
   state.nodes.forEach(syncNodeToPlan);
-  BUCKET_NAMES.forEach((bucketName) => setBucketItems(bucketName, bucketItems(bucketName)));
+  bucketNames().forEach((bucketName) => setBucketItems(bucketName, bucketItems(bucketName)));
 }
 
 function renderBoard() {
   if (!currentPlan() || !$("#bubbleBoard")) return;
   window.cancelAnimationFrame(state.animationId);
-  document.body.classList.toggle("dca-off", !isDcaEnabled());
+  document.body.classList.toggle("dca-off", !isPlanStrategyEnabled());
   calculateLayout();
   fitBucketRadii();
   buildNodes();
@@ -507,12 +554,12 @@ function renderBoard() {
   svg.classList.toggle("resize-mode", Boolean(state.selected));
   svg.replaceChildren();
 
-  BUCKET_NAMES.forEach((bucketName) => {
+  bucketNames().forEach((bucketName) => {
     const bucket = state.layout.buckets[bucketName];
     const color = bucketColor(bucketName);
     const blob = svgEl("path", {
       id: `${bucketName}-blob`,
-      class: `bucket-blob ${bucketName}`,
+      class: `bucket-blob ${bucketName} ${bucketNames().indexOf(bucketName) === 1 ? "is-second" : "is-first"}`,
       fill: color,
       stroke: bucketStrokeColor(bucketName),
       d: organicPath(bucketName),
@@ -532,7 +579,7 @@ function renderBoard() {
       y: bucket.cy + 24,
       "text-anchor": "middle",
       fill: color,
-    }, isDcaEnabled() ? money(bucketItems(bucketName).reduce((sum, item) => sum + Number(item.amount || 0), 0)) : "DCA off"));
+    }, isPlanStrategyEnabled() ? amountLabel(bucketItems(bucketName).reduce((sum, item) => sum + Number(item.amount || 0), 0)) : "Not deployed"));
   });
 
   state.nodes.forEach((node) => renderAsset(svg, node, "live"));
@@ -556,7 +603,7 @@ function renderAsset(svg, node, extraClass) {
   });
   group.appendChild(svgEl("circle", { r: node.radius, fill: bucketColor(node.bucketName) }));
   group.appendChild(textEl({ class: "symbol-label", y: -5 }, node.symbol));
-  group.appendChild(textEl({ class: "amount-label", y: AMOUNT_LABEL_DY }, `$${Math.round(node.amount)}`));
+  group.appendChild(textEl({ class: "amount-label", y: AMOUNT_LABEL_DY }, amountLabel(node.amount)));
   group.addEventListener("pointerdown", (event) => startAssetPointer(event, node));
   group.addEventListener("wheel", (event) => resizeNode(event, node), { passive: false });
   group.addEventListener("dblclick", (event) => {
@@ -571,7 +618,7 @@ function renderDraft(svg, node) {
   group.appendChild(svgEl("circle", { r: node.radius, fill: bucketColor(node.bucketName) }));
   // show nothing in-SVG when drafting; the visible caret is provided by the positioned #symbolEntry input
   group.appendChild(textEl({ class: "symbol-label", y: -5 }, node.symbol || ""));
-  group.appendChild(textEl({ class: "amount-label", y: 14 }, "$25"));
+  group.appendChild(textEl({ class: "amount-label", y: 14 }, amountLabel(wheelStep())));
   svg.appendChild(group);
 }
 
@@ -584,14 +631,14 @@ function renderInvalidAsset(svg, node) {
 }
 
 function updateBoardElements(phase = 0) {
-  BUCKET_NAMES.forEach((bucketName) => {
+  bucketNames().forEach((bucketName) => {
     const blob = $(`#${bucketName}-blob`);
     const total = $(`#${bucketName}-total`);
     if (blob) blob.setAttribute("d", organicPath(bucketName, phase));
     if (total) {
-      total.textContent = isDcaEnabled()
-        ? money(bucketItems(bucketName).reduce((sum, item) => sum + Number(item.amount || 0), 0))
-        : "DCA off";
+      total.textContent = isPlanStrategyEnabled()
+        ? amountLabel(bucketItems(bucketName).reduce((sum, item) => sum + Number(item.amount || 0), 0))
+        : "Not deployed";
     }
   });
   state.nodes.forEach((node) => {
@@ -600,7 +647,7 @@ function updateBoardElements(phase = 0) {
     group.setAttribute("transform", `translate(${node.x}, ${node.y})`);
     group.querySelector("circle")?.setAttribute("r", node.radius);
     const amount = group.querySelector(".amount-label");
-    if (amount) amount.textContent = `$${Math.round(node.amount)}`;
+    if (amount) amount.textContent = amountLabel(node.amount);
   });
 }
 
@@ -614,7 +661,7 @@ function startAnimation() {
 }
 
 function stepPhysics() {
-  BUCKET_NAMES.forEach((bucketName) => {
+  bucketNames().forEach((bucketName) => {
     const bucket = state.layout.buckets[bucketName];
     const nodes = state.nodes.filter((node) => node.bucketName === bucketName);
     nodes.forEach((node, index) => {
@@ -731,7 +778,7 @@ function updateTouchPointer(event, node) {
 //: business expressing $310, but a typed number means precisely what it says, so rounding it
 //: to the nearest $25 would silently discard what the reader just asked for.
 function setNodeAmount(node, amount) {
-  node.amount = clamp(Math.round(amount), 0, MAX_AMOUNT);
+  node.amount = clamp(Math.round(amount), 0, maxAmount());
   node.radius = itemRadius(node.amount);
   syncNodeToPlan(node);
   schedulePlanSave();
@@ -749,7 +796,7 @@ function syncAmountEntryTo(node) {
 }
 
 function resizeNodeToAmount(node, amount) {
-  setNodeAmount(node, clamp(Math.round(amount / WHEEL_STEP) * WHEEL_STEP, 0, MAX_AMOUNT));
+  setNodeAmount(node, clamp(Math.round(amount / wheelStep()) * wheelStep(), 0, maxAmount()));
 }
 
 function selectedDcaNode() {
@@ -896,7 +943,7 @@ function resizeNode(event, node) {
   event.preventDefault();
   event.stopPropagation();
   const direction = event.deltaY > 0 ? 1 : -1;
-  resizeNodeToAmount(node, Math.round(node.amount / WHEEL_STEP) * WHEEL_STEP + direction * WHEEL_STEP);
+  resizeNodeToAmount(node, Math.round(node.amount / wheelStep()) * wheelStep() + direction * wheelStep());
   renderDca();
 }
 
@@ -1015,9 +1062,9 @@ function commitAmountEntry() {
   if (digits === "") {
     // Cleared and confirmed reads as "never mind", not as a budget of zero -- type 0 for that.
     setNodeAmount(node, edit.originalAmount);
-  } else if (Number(digits) > MAX_AMOUNT) {
+  } else if (Number(digits) > maxAmount()) {
     // Already clamped on screen; say why, so a smaller number than was typed is not a mystery.
-    showToast(`${edit.symbol} capped at ${money(MAX_AMOUNT)}/month`);
+    showToast(`${edit.symbol} capped at ${amountLabel(maxAmount())}`);
   }
   renderBoard();
 }
@@ -1073,17 +1120,17 @@ function removeSymbol(bucketName, symbol) {
 }
 
 function moveAsset(node) {
-  const fromItems = BUCKET_NAMES.flatMap((bucketName) =>
+  const fromItems = bucketNames().flatMap((bucketName) =>
     bucketItems(bucketName).map((item) => ({ bucketName, item })),
   );
   const found = fromItems.find(({ item }) => item.symbol === node.symbol);
   if (!found) return;
-  BUCKET_NAMES.forEach((bucketName) => {
+  bucketNames().forEach((bucketName) => {
     currentPlan()[bucketName].items = bucketItems(bucketName).filter((item) => item.symbol !== node.symbol);
   });
   found.item.amount = node.amount;
   currentPlan()[node.bucketName].items.push(found.item);
-  BUCKET_NAMES.forEach((bucketName) => setBucketItems(bucketName, bucketItems(bucketName)));
+  bucketNames().forEach((bucketName) => setBucketItems(bucketName, bucketItems(bucketName)));
   schedulePlanSave();
 }
 
@@ -1146,7 +1193,7 @@ function bindingById(bindingId) {
   return bindings().find((binding) => String(binding.id) === String(bindingId)) || null;
 }
 
-function isDcaEnabled() {
+function isPlanStrategyEnabled() {
   // The board edits one algorithm's plan, so it is that algorithm's bindings that light it up.
   return bindings().some((binding) => binding.enabled && binding.strategy === planStrategyKey());
 }
@@ -1447,7 +1494,11 @@ function priceAgeBadge(row) {
 //: The gate strip: one pip per check, in the order the algorithm applied them. Filled is a pass,
 //: hollow a fail, and the blocking one is marked separately -- several gates can fail at once
 //: while only the first decided anything.
-function gateStrip(checks) {
+//: Readings are excluded here and shown separately below: a pip is a hurdle cleared or not,
+//: and something that can never refuse a trade is neither. Twelve gates rendered as eighteen
+//: pips, which read as a stricter strategy than the one that is running.
+function gateStrip(allChecks) {
+  const checks = allChecks.filter((check) => check.gate !== false);
   if (!checks.length) return `<span class="gateStrip is-empty" title="No gates applied to this row">—</span>`;
   const pips = checks.map((check) => {
     const cls = check.ok ? "is-pass" : check.blocking ? "is-blocking" : "is-fail";
@@ -1465,7 +1516,13 @@ function gateDetail(row) {
   if (!row.checks?.length) {
     return `<p class="gateEmpty">No gates were recorded for ${escapeHtml(row.symbol)} on this run.</p>`;
   }
-  const items = row.checks.map((check) => {
+  // Gates only. A reading is measured alongside the decision and never part of it, and every
+  // one worth acting on is already a column on the row -- the band, the contract, the stop.
+  // Listing them here a second time made a deck of thirteen gates read as eighteen. They stay
+  // in the payload, where an agent or a debugging session can still reach them.
+  const gates = row.checks.filter((check) => check.gate !== false);
+
+  const item = (check) => {
     const cls = check.ok ? "is-pass" : check.blocking ? "is-blocking" : "is-fail";
     return `<li class="gateItem ${cls}">
       <span class="gateVerdict">${check.ok ? "PASS" : "FAIL"}</span>
@@ -1473,8 +1530,14 @@ function gateDetail(row) {
       <span class="gateValue">${escapeHtml(check.value || "—")}</span>
       <span class="gateLimit">${check.limit ? escapeHtml(`needs ${check.limit}`) : ""}</span>
     </li>`;
-  }).join("");
-  return `<ul class="gateList">${items}</ul>`;
+  };
+  // A reading carries no verdict, because it has nothing to pass or fail. Kept on the row
+  // rather than dropped: on a held position the resting target and stop are readings, and they
+  // are the two most useful lines there.
+
+  // No summary line: the pip strip on the row already counts them, and which ones refused is
+  // the list immediately below, marked on each entry.
+  return `<ul class="gateList">${gates.map(item).join("")}</ul>`;
 }
 
 function renderSignalTable(rows) {
@@ -2535,7 +2598,7 @@ function accountPositionsTable(positions) {
     <div class="tableWrap is-scroll">
       <table class="dataTable">
         <thead>
-          <tr><th>Symbol</th><th class="num">Qty</th><th class="num">Avg</th><th class="num">Value</th><th class="num">P/L</th></tr>
+          <tr><th>Symbol</th><th class="num">Qty</th><th class="num">Avg</th><th class="num">Current</th><th class="num">Value</th><th class="num">P/L</th></tr>
         </thead>
         <tbody>
           ${positions.rows.map((row) => `
@@ -2543,6 +2606,7 @@ function accountPositionsTable(positions) {
               <td><strong>${escapeHtml(row.symbol)}</strong></td>
               <td class="num">${escapeHtml(num(row.qty, row.qty % 1 ? 3 : 0))}</td>
               <td class="num">${escapeHtml(money(row.avg_entry_price, 2))}</td>
+              <td class="num">${row.current_price ? escapeHtml(money(row.current_price, 2)) : "--"}</td>
               <td class="num">${escapeHtml(money(row.market_value, 2))}</td>
               <td class="num ${row.unrealized_pl >= 0 ? "gain" : "loss"}">${escapeHtml(money(row.unrealized_pl, 2))}
                 <span class="tableNote">${escapeHtml(percent(row.unrealized_plpc))}</span></td>
@@ -2655,8 +2719,10 @@ function explainerCard(strategy) {
 function renderTuneTab(body, strategy) {
   const hasBudgets = usesBudgetsEditor(strategy.key);
   ensureAlgorithmConfig(strategy.key);
+  // The editor comes first and the explanation second. Tune is the page you open to *change*
+  // something, and the explainer runs to a screenful on an algorithm with a long formula --
+  // which put the control the reader came for below the fold on every visit.
   body.innerHTML = `
-    ${explainerCard(strategy)}
     ${hasBudgets ? `
     <section class="card tuneCard">
       <div class="cardHead">
@@ -2672,12 +2738,13 @@ function renderTuneTab(body, strategy) {
       </div>
       <div class="tuneBody" id="tuneBody"></div>
       <div class="cardActions" id="configActions" hidden><button class="ctl" type="button" id="saveConfigButton">Save changes</button></div>
-    </section>`;
-  if (hasBudgets) renderDcaTuner($("#dcaBoard"), strategy);
+    </section>
+    ${explainerCard(strategy)}`;
+  if (hasBudgets) renderBudgetBoard($("#dcaBoard"), strategy);
   renderConfigForm($("#tuneBody"), strategy);
 }
 
-function renderDcaTuner(host, strategy) {
+function renderBudgetBoard(host, strategy) {
   const hint = $("#tuneHint");
   const entry = state.algorithmConfigs[strategy.key];
   const plan = entry?.explainer?.parameters?.plan;
@@ -2695,7 +2762,10 @@ function renderDcaTuner(host, strategy) {
     host.innerHTML = `<p class="emptyState">Loading budgets.</p>`;
     return;
   }
-  if (hint) hint.textContent = `Dollars per month, per symbol · algorithms.${entry.config_key || strategy.key}.plan`;
+  // The algorithm says what a bubble's number means -- a month of budget for DCA, a position's
+  // risk for Options Flip -- so the board does not have to assume one reading.
+  const unitHint = entry.tune_budget_hint || "Dollars per month, per symbol";
+  if (hint) hint.textContent = `${unitHint} · algorithms.${entry.config_key || strategy.key}.plan`;
   host.innerHTML = `<svg class="bubbleBoard" id="bubbleBoard" role="img"
     aria-label="Interactive buy and sell budget bubbles"></svg>
     <p class="cardHint">${escapeHtml(plan?.effect || "")} Scroll a bubble to change its budget, or select one and type the amount. Drag between buckets, drag one off the buckets to remove it, double-click to add.
@@ -2815,6 +2885,7 @@ function renderOverviewTab(body, strategy, deployment) {
           <h2>Orders this algorithm placed</h2>
           <div class="cardHeadActions">
             ${deployment ? `<span class="cardHint">on <a class="factLink" href="#/account/${escapeHtml(deployment.account_id)}">${escapeHtml(accountLabel(deployment.account_id))}</a></span>` : ""}
+            <button class="ctl" type="button" id="clearAlgoOrdersButton">Clear</button>
             <button class="ctl" type="button" id="refreshAlgoOrdersButton">Refresh</button>
           </div>
         </div>
@@ -2877,7 +2948,7 @@ function algorithmOrdersTable(journal) {
     <div class="tableWrap is-scroll">
       <table class="dataTable">
         <thead>
-          <tr><th>Time</th><th>Symbol</th><th>Side</th><th class="num">Qty</th><th>Status</th></tr>
+          <tr><th>Time</th><th>Symbol</th><th>Side</th><th>Detail</th><th>Status</th></tr>
         </thead>
         <tbody>
           ${journal.rows.map((row) => `
@@ -2885,7 +2956,15 @@ function algorithmOrdersTable(journal) {
               <td class="nowrap">${escapeHtml(formatActivityTime(row.submitted_at))}</td>
               <td><strong>${escapeHtml(row.symbol)}</strong></td>
               <td><span class="side is-${escapeHtml(orderSideClass(row.side))}">${escapeHtml(row.side)}</span></td>
-              <td class="num">${escapeHtml(row.quantity ? num(row.quantity, row.quantity % 1 ? 3 : 0) : "--")}</td>
+              <td class="nowrap">${escapeHtml(formatActivityDetail({
+                qty: row.quantity,
+                filled_qty: row.status === "submitted" ? row.quantity : 0,
+                filled_avg_price: null,
+                limit_price: row.limit_price,
+                stop_price: row.stop_price,
+                order_type: row.order_type,
+                est_price: row.price,
+              }))}</td>
               <td class="tableNote" title="${escapeHtml(row.reason || "")}">${escapeHtml(row.status)}</td>
             </tr>`).join("")}
         </tbody>
@@ -2920,13 +2999,32 @@ async function ensureAlgorithmConfig(strategyKey) {
   }
 }
 
+//: Size and price, in that order, saying which price it is.
+//:
+//: A filled order has one true price and that is what it paid. An order still resting has none
+//: -- ``filled_avg_price`` is null -- but it is *asking* one, and that limit or stop is the
+//: whole substance of the order: "sell 1" says nothing, "sell 1 @ $17.30 limit" says what will
+//: happen and when. A market order really has no price to name and says so, rather than
+//: borrowing the mark it was sized from and presenting an estimate as a fact.
 function formatActivityDetail(row) {
+  const qty = Number(row.filled_qty || 0) || Number(row.qty || 0);
+  const size = qty ? num(qty, qty % 1 ? 3 : 0) : "";
+
   const filled = Number(row.filled_qty || 0);
-  if (filled > 0 && row.filled_avg_price) {
-    return `${num(filled, filled % 1 ? 3 : 0)} @ ${money(row.filled_avg_price, 2)}`;
-  }
-  const qty = Number(row.qty || 0);
-  return qty ? `${num(qty, qty % 1 ? 3 : 0)} requested` : "--";
+  if (filled > 0 && row.filled_avg_price) return `${size} @ ${money(row.filled_avg_price, 2)} filled`;
+
+  const limit = Number(row.limit_price || 0);
+  const stop = Number(row.stop_price || 0);
+  if (limit > 0) return `${size} @ ${money(limit, 2)} limit`;
+  if (stop > 0) return `${size} @ ${money(stop, 2)} stop`;
+
+  // A market order names no price, but it was *sized* from one. Marked with a tilde so the
+  // estimate is never mistaken for what the order paid.
+  const sized = Number(row.est_price || 0);
+  if (size && sized > 0) return `${size} @ ~${money(sized, 2)}`;
+  const type = String(row.order_type || "").toLowerCase();
+  if (size && type.includes("market")) return `${size} at market`;
+  return size ? `${size} requested` : "--";
 }
 
 function formatActivityTime(value) {
@@ -2962,6 +3060,28 @@ async function ensureAlgorithmActivity(strategyKey) {
     state.algorithmActivityLoading[strategyKey] = false;
     render();
   }
+}
+
+//: ensureAlgorithmActivity is cache-first (see above), so a "Refresh" click has to drop the
+//: cached copy before asking again -- calling it directly would just see the cache and do
+//: nothing, which is why the button used to appear to do nothing at all.
+function refreshAlgorithmActivity(strategyKey) {
+  delete state.algorithmActivity[strategyKey];
+  ensureAlgorithmActivity(strategyKey);
+}
+
+//: Clears this algorithm's own journal server-side -- not the broker's order history, which
+//: the account page's "Recent orders" reads directly from the broker and this never touches.
+async function clearAlgorithmActivity(strategyKey) {
+  try {
+    state.algorithmActivity[strategyKey] = await api(
+      `/api/algorithm-activity/clear?strategy=${encodeURIComponent(strategyKey)}`,
+      { method: "POST", timeoutMs: 8000 });
+  } catch (error) {
+    showToast(`Could not clear: ${error.message}`);
+    return;
+  }
+  render();
 }
 
 async function ensurePositions(accountId) {
@@ -3171,10 +3291,8 @@ function wireEvents() {
       else state.expandedSignals.add(symbol);
       return render();
     }
-    if (event.target.closest("#refreshAlgoOrdersButton")) {
-      delete state.algorithmActivity[route.id];
-      return ensureAlgorithmActivity(route.id);
-    }
+    if (event.target.closest("#refreshAlgoOrdersButton")) return refreshAlgorithmActivity(route.id);
+    if (event.target.closest("#clearAlgoOrdersButton")) return clearAlgorithmActivity(route.id);
     if (event.target.closest("#refreshUniverseButton")) return recommendUniverse();
     if (event.target.closest("[data-apply-universe]")) return applyUniverseProposal();
     if (event.target.closest('[data-role="power"]')) {
@@ -3289,7 +3407,7 @@ function wireEvents() {
       }
     }
     if ((event.key === "Delete" || event.key === "Backspace") && state.selected) {
-      const found = BUCKET_NAMES.flatMap((bucketName) =>
+      const found = bucketNames().flatMap((bucketName) =>
         bucketItems(bucketName).map((item) => ({ bucketName, item })),
       ).find(({ item }) => item.symbol === state.selected);
       if (found) {

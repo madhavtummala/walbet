@@ -3,7 +3,9 @@ from __future__ import annotations
 from pathlib import Path
 
 import re
+
 import pandas as pd
+import pytest
 
 from src.api.web_app import controls_payload, status_payload, universe_payload
 
@@ -251,9 +253,9 @@ def test_tune_tab_renders_the_right_editor_per_algorithm() -> None:
     # config: its regime gate, scaling factor and cap knobs live in the config section like
     # every other algorithm's. It used to get the board *instead of* the parameter form, which
     # left those with no editor at all. It now gets both; everything else gets the form.
-    assert "function renderDcaTuner" in app_js
+    assert "function renderBudgetBoard" in app_js
     assert "function renderConfigForm" in app_js
-    assert 'if (hasBudgets) renderDcaTuner($("#dcaBoard"), strategy);' in app_js
+    assert 'if (hasBudgets) renderBudgetBoard($("#dcaBoard"), strategy);' in app_js
     assert 'renderConfigForm($("#tuneBody"), strategy);' in app_js
     # The save button is no longer suppressed, because there is now a form to save.
     assert 'hasBudgets ? "" : `<div class="cardActions">' not in app_js
@@ -307,17 +309,25 @@ def test_one_algorithms_bubbles_are_never_written_into_anothers_plan() -> None:
     sync = app_js[app_js.index("function syncNodesToPlan"):app_js.index("function renderBoard")]
     assert "if (state.nodesStrategy !== planStrategyKey()) return;" in sync
     # And the board starts clean rather than animating the previous algorithm's bubbles.
-    tuner = app_js[app_js.index("function renderDcaTuner"):app_js.index("function renderConfigForm")]
+    tuner = app_js[app_js.index("function renderBudgetBoard"):app_js.index("function renderConfigForm")]
     assert "state.nodes = [];" in tuner
 
 
 def test_signals_and_backtests_still_name_the_account_they_ran_for() -> None:
     """Accrual state stays per (algorithm, account), and the broker is per account, so a view
-    still has to say which deployment it describes even though the plan no longer varies."""
+    still has to say which deployment it describes even though the plan no longer varies.
+
+    The signals request builds its query with ``URLSearchParams`` rather than by interpolating
+    into a template string, which is why this no longer looks for an ``encodeURIComponent``
+    call: the encoding is the URL builder's job now.
+    """
     app_js, _, _ = _assets()
 
     assert "function accountForStrategy" in app_js
-    assert "account_id=${encodeURIComponent(account)}" in app_js
+    # Signals: account_id goes into the query the fetch is built from.
+    assert "const account = accountForStrategy(strategyKey);" in app_js
+    assert "account_id: account," in app_js
+    # Backtests: the same answer, in the request body.
     assert "account_id: accountForStrategy(strategyKey)," in app_js
 
 
@@ -554,3 +564,52 @@ def test_the_bot_pill_describes_the_algorithms_not_the_container() -> None:
     # The dot carries it; the words only repeated the colour, so they live in the tooltip.
     assert "escapeHtml(runtime.label)" not in app_js
     assert "escapeHtml(runtime.note)" not in app_js
+
+
+def test_a_board_ceiling_is_a_value_the_board_actually_reaches() -> None:
+    """A bubble's radius goes as sqrt(amount / ceiling), so a ceiling set far above the values
+    in use renders every one of them as a dot -- a $25,000 ceiling drew a $1,000 position
+    smaller than a $400 DCA budget.
+
+    Both boards should put an ordinary entry in the middle of their scale, not the bottom.
+    """
+    from src.algorithms.bursty_dca.algorithm import BurstyDCAAlgorithm
+    from src.algorithms.options_flip.algorithm import OptionsFlipAlgorithm
+
+    # A typical entry on each board, as a fraction of that board's ceiling.
+    dca = 400 / BurstyDCAAlgorithm.tune_max_amount
+    flip = 1_000 / OptionsFlipAlgorithm.tune_max_amount
+    assert 0.1 <= dca <= 0.6 and 0.1 <= flip <= 0.6
+    assert flip == pytest.approx(dca, rel=0.01), "the same relative size on both boards"
+
+
+def test_the_budget_board_is_one_component_for_every_algorithm() -> None:
+    """Which buckets, what an amount means, how far it scales -- all declared per algorithm and
+    read through ``boardSpec``. Two boards that merely looked alike would drift."""
+    app_js, _, _ = _assets()
+
+    for builder in (
+        "renderBudgetBoard", "renderBoard", "buildNodes", "calculateLayout", "itemRadius",
+        "fitBucketRadii", "bucketColor", "nearestBucket", "boardSpec",
+    ):
+        assert app_js.count(f"function {builder}") == 1, f"{builder} must have one implementation"
+    # Nothing in the board branches on which algorithm it is drawing.
+    board = app_js[app_js.index("function itemRadius"):app_js.index("function renderDcaSummary")] \
+        if "function renderDcaSummary" in app_js else app_js[app_js.index("function itemRadius"):app_js.index("function planStrategyKey")]
+    for hardcoded in ('=== "buy"', '=== "sell"', '=== "call"', '=== "put"'):
+        assert hardcoded not in board, f"the board still branches on {hardcoded}"
+
+
+def test_an_order_row_says_which_price_it_is_showing() -> None:
+    """A filled order has one true price; a resting one is only *asking* its limit or stop; a
+    market order names none at all and shows the mark it was sized from, tilde-marked.
+
+    "sell 1" says nothing. "sell 1 @ $17.30 limit" says what will happen and when.
+    """
+    app_js, _, _ = _assets()
+
+    detail = app_js[app_js.index("function formatActivityDetail"):app_js.index("function formatActivityTime")]
+    assert "filled`" in detail and "limit`" in detail and "stop`" in detail
+    assert "~${money(sized, 2)}" in detail, "a market order's price is an estimate, not a fact"
+    # Both tables go through it, so the journal and the broker view cannot disagree.
+    assert app_js.count("formatActivityDetail(") >= 2

@@ -19,12 +19,13 @@ from .strategy_config import config_for_strategy_view
 from ...core.config import (
     DEFAULT_STRATEGY_ID,
     load_algorithms_config,
+    config_transaction,
     save_algorithms_config,
 )
 from ...algorithms.explainers import explainer_for
 from ...algorithms.registry import LEGACY_ALGORITHM_IDS, canonical_algorithm_id, get_algorithm_class
 from ...core.runner import run_algorithm
-from ...data.order_journal import load_order_journal
+from ...data.order_journal import clear_order_journal, load_order_journal
 from ...data.state_store import load_state, save_state
 
 logger = logging.getLogger(__name__)
@@ -95,6 +96,33 @@ def _tune_editor(strategy: str) -> str | None:
 
 
 
+def _tune_attr(strategy: str, name: str, default: Any) -> Any:
+    """One Tune-screen declaration off the algorithm class, with a fallback for unknown ids."""
+    try:
+        return getattr(get_algorithm_class(strategy), name, default)
+    except (KeyError, TypeError, ValueError):
+        return default
+
+
+def _with_seeded_board(strategy: str, values: dict[str, Any]) -> dict[str, Any]:
+    """Fill in the board an algorithm would open with, when nothing is saved yet.
+
+    The editor draws bubbles from ``config.plan``, so an algorithm that has never been tuned
+    renders an empty canvas -- which reads as "this trades nothing" when in fact it trades on
+    its global defaults. Asking the algorithm for its own opening board is the honest answer,
+    and it is read-only: nothing is written until the reader saves.
+    """
+    if _tune_editor(strategy) != "budgets" or isinstance(values.get("plan"), dict) and values["plan"]:
+        return values
+    try:
+        algorithm = get_algorithm_class(strategy).from_config(config_for_strategy_view(strategy, ""))
+        board = algorithm.budget_plan(config_for_strategy_view(strategy, ""))
+    except Exception as exc:  # noqa: BLE001 - a board that cannot be seeded is still editable
+        logger.warning("Could not seed the %s board: %s", strategy, exc)
+        return values
+    return {**values, "plan": board}
+
+
 def algorithm_config_payload(strategy: str) -> dict[str, Any]:
     """The saved tuning for one algorithm, read from the key it actually lives under."""
     strategy = canonical_algorithm_id(strategy)[:80]
@@ -105,6 +133,7 @@ def algorithm_config_payload(strategy: str) -> dict[str, Any]:
         (legacy for legacy in LEGACY_ALGORITHM_IDS.get(strategy, []) if legacy in sections), strategy
     )
     values = sections.get(key) if isinstance(sections.get(key), dict) else {}
+    values = _with_seeded_board(strategy, values)
     return {
         "strategy": strategy,
         # Surfaced so the dashboard can say which key on disk a value came from: several
@@ -113,6 +142,15 @@ def algorithm_config_payload(strategy: str) -> dict[str, Any]:
         "config": values,
         # Declared by the algorithm class: None means the generic parameter form.
         "tune_editor": _tune_editor(strategy),
+        # Which buckets that editor splits symbols across, and what an amount means. Asked of
+        # the algorithm rather than hardcoded in the dashboard, which is what limited the board
+        # to algorithms whose buckets happened to be named buy and sell.
+        "tune_buckets": [str(b) for b in _tune_attr(strategy, "tune_buckets", ("buy", "sell"))],
+        "tune_budget_hint": str(_tune_attr(strategy, "tune_budget_hint", "") or ""),
+        # How the board reads and edits a bubble's number. One component, two units.
+        "tune_unit": str(_tune_attr(strategy, "tune_unit", "currency")),
+        "tune_max_amount": float(_tune_attr(strategy, "tune_max_amount", 2000.0)),
+        "tune_step": float(_tune_attr(strategy, "tune_step", 25.0)),
         "explainer": explainer_for(strategy),
     }
 
@@ -123,18 +161,19 @@ def save_algorithm_config_payload(strategy: str, values: Any) -> dict[str, Any]:
     # quietly erase every tuned value for this algorithm, so refuse instead.
     if not isinstance(values, dict):
         raise ValueError("Algorithm config must be a JSON object.")
-    raw = load_algorithms_config()
-    sections = raw.setdefault("algorithms", {})
-    if not isinstance(sections, dict):
-        sections = {}
-        raw["algorithms"] = sections
-    # Write back to the key it was read from, so retired ids keep their tuning rather than
-    # gaining a second, silently-ignored copy under the canonical name.
-    key = strategy if strategy in sections else next(
-        (legacy for legacy in LEGACY_ALGORITHM_IDS.get(strategy, []) if legacy in sections), strategy
-    )
-    sections[key] = values
-    save_algorithms_config(raw)
+    with config_transaction():
+        raw = load_algorithms_config()
+        sections = raw.setdefault("algorithms", {})
+        if not isinstance(sections, dict):
+            sections = {}
+            raw["algorithms"] = sections
+        # Write back to the key it was read from, so retired ids keep their tuning rather than
+        # gaining a second, silently-ignored copy under the canonical name.
+        key = strategy if strategy in sections else next(
+            (legacy for legacy in LEGACY_ALGORITHM_IDS.get(strategy, []) if legacy in sections), strategy
+        )
+        sections[key] = values
+        save_algorithms_config(raw)
     return algorithm_config_payload(strategy)
 
 
@@ -149,6 +188,17 @@ def algorithm_activity_payload(strategy: str = "", limit: int = 40) -> dict[str,
         "strategy": strategy_id,
         "rows": load_order_journal(strategy=strategy_id, limit=limit),
     }
+
+
+def clear_algorithm_activity_payload(strategy: str = "") -> dict[str, Any]:
+    """Drop this algorithm's journal entries and return the now-empty view.
+
+    Display-only: the broker's own order history (the account page's "Recent orders") is
+    untouched, since that is read from the broker directly rather than from this journal.
+    """
+    strategy_id = canonical_algorithm_id(strategy) if strategy else ""
+    cleared = clear_order_journal(strategy=strategy_id)
+    return {"strategy": strategy_id, "rows": [], "cleared": cleared}
 
 
 def strategy_signals_payload(

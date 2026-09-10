@@ -34,7 +34,14 @@ def _entry(strategy: str, account_id: str, order: dict[str, Any], recorded_at: s
         "side": action,
         "quantity": float(quantity) if isinstance(quantity, (int, float)) else 0.0,
         "notional": float(order.get("notional") or 0.0),
+        # The price the order actually carries. ``latest_price`` is the mark a *market* order
+        # was sized from -- an estimate, not a price the order names -- while a resting limit or
+        # stop names one exactly, and the reconciler reports it. Recording only the former left
+        # every option order in the journal at 0.00, since none of them is a market order.
         "price": float(order.get("latest_price") or 0.0),
+        "order_type": str(order.get("order_type") or ""),
+        "limit_price": float(order.get("limit_price") or 0.0),
+        "stop_price": float(order.get("stop_price") or 0.0),
         "status": status,
         "order_id": str(order.get("order_id") or ""),
         "reason": str(order.get("reason") or ""),
@@ -51,7 +58,17 @@ def record_orders(
     Never raises: a failure to journal must not take down a run that already placed real
     orders, so callers can treat this as fire and forget.
     """
-    orders = [order for order in (order_results or []) if isinstance(order, dict)]
+    # "unchanged" means the reconciler found the resting order already correct and sent
+    # nothing to the broker -- see reconcile.py's own comment on why that is a distinct
+    # outcome from "submitted"/"replaced" rather than a third kind of action. Journaling it
+    # anyway would mean an algorithm polling every five minutes writes a no-op entry every
+    # five minutes it has nothing to report, which is exactly the noise this journal's own
+    # cap (see JOURNAL_LIMIT) exists to not fill up with -- a busy day's real actions would
+    # get pushed out early by a quiet position doing nothing but confirming itself.
+    orders = [
+        order for order in (order_results or [])
+        if isinstance(order, dict) and order.get("reconciled") != "unchanged"
+    ]
     if not orders:
         return []
     recorded_at = datetime.now(timezone.utc).isoformat()
@@ -81,3 +98,27 @@ def load_order_journal(
     if account_id:
         rows = [row for row in rows if str(row.get("account_id") or "") == account_id]
     return list(reversed(rows))[: max(1, int(limit))]
+
+
+def clear_order_journal(strategy: str = "", account_id: str = "") -> int:
+    """Drop entries matching ``strategy``/``account_id`` (both empty clears everything).
+
+    This is display-only bookkeeping, not an audit ledger (see the module docstring) -- the
+    broker's own order history is untouched, so clearing here never hides anything the account
+    activity view would still show. Returns how many entries were dropped.
+    """
+    journal = load_state(JOURNAL_KEY, [])
+    if not isinstance(journal, list):
+        return 0
+    rows = [row for row in journal if isinstance(row, dict)]
+
+    def _matches(row: dict[str, Any]) -> bool:
+        if strategy and str(row.get("strategy") or "") != strategy:
+            return False
+        if account_id and str(row.get("account_id") or "") != account_id:
+            return False
+        return True
+
+    kept = [row for row in rows if not _matches(row)]
+    save_state(JOURNAL_KEY, kept)
+    return len(rows) - len(kept)

@@ -125,6 +125,15 @@ def test_replay_state_is_isolated_from_the_live_store() -> None:
             save_state("replay_probe", {"live": False})
             assert load_state("replay_probe", None) == {"live": False}
         assert load_state("replay_probe", None) == {"live": True}  # write never leaked
+
+        # Deletes are sandboxed too. ``delete_state`` used to go straight to DuckDB while its
+        # two siblings honoured the ContextVar, so a replay that dropped a key reached past the
+        # sandbox and destroyed the live account's state -- the exact failure this exists to
+        # prevent, one call site away from happening.
+        with ephemeral_state({"replay_probe": {"live": False}}):
+            delete_state("replay_probe")
+            assert load_state("replay_probe", None) is None
+        assert load_state("replay_probe", None) == {"live": True}
     finally:
         delete_state("replay_probe")
 
@@ -191,10 +200,13 @@ def test_every_registered_algorithm_declares_what_the_replay_needs() -> None:
     """The replay satisfies ``requirements()``; an algorithm that fetches its own data inside
     ``plan`` instead cannot be replayed and would need a hand-written backtest branch.
     """
-    # A DCA plan is ordinary algorithm config, so an algorithm with none declares no symbols
-    # -- correctly, since it would buy nothing. Give them one so this tests what it means to.
+    # A board is ordinary algorithm config, so an algorithm with none declares no symbols --
+    # correctly, since it would trade nothing. Give each board-driven algorithm one so this
+    # tests what it means to. Options Flip joined them when its ``symbols`` knob was retired:
+    # which symbols it trades is the board's statement now, exactly as it is for DCA.
     plan = {"plan": {"buy": {"items": [{"symbol": "SPY", "amount": 100.0}]}, "sell": {"items": []}}}
-    config = Config(algorithm_configs={"dca": plan, "bursty_dca": plan})
+    contracts = {"plan": {"call": {"items": [{"symbol": "SPY", "amount": 1}]}, "put": {"items": []}}}
+    config = Config(algorithm_configs={"dca": plan, "bursty_dca": plan, "options_flip": contracts})
     for algorithm_id in sorted(ALGORITHM_IDS):
         algorithm = get_algorithm_class(algorithm_id)
         requirements = algorithm.from_config(config).requirements(config, {})

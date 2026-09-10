@@ -43,6 +43,24 @@ def test_a_skipped_order_still_records_why() -> None:
 def test_journalling_never_raises_on_a_bad_payload() -> None:
     with ephemeral_state():
         assert record_orders("dca", "paper", []) == []
+
+
+def test_an_unchanged_order_is_not_journalled() -> None:
+    """The reconciler found nothing to do -- that is not an event worth a journal line.
+
+    A lifecycle algorithm polls every few minutes; "still correct, did nothing" every single
+    poll would fill the capped journal with no-op noise and push real actions out early.
+    """
+    with ephemeral_state():
+        written = record_orders("options_flip", "paper", [
+            {"symbol": "GLD", "action": "sell", "quantity": 1, "reconciled": "unchanged"},
+            {"symbol": "GLD", "action": "sell", "quantity": 1, "reconciled": "rejected", "status": "rejected"},
+        ])
+
+        assert len(written) == 1  # only the rejected row was journalled
+        rows = load_order_journal(strategy="options_flip")
+        assert len(rows) == 1
+        assert rows[0]["status"] == "rejected"
         assert record_orders("dca", "paper", ["not-a-dict"]) == []  # type: ignore[list-item]
 
 
@@ -65,3 +83,32 @@ def test_a_backtest_cannot_pollute_the_live_journal() -> None:
 
     with ephemeral_state():
         assert load_order_journal() == []
+
+
+def test_the_journal_records_the_price_the_order_names() -> None:
+    """``latest_price`` is the mark a *market* order was sized from -- an estimate, not a price
+    the order carries. A resting limit or stop names one exactly, and the reconciler reports it.
+
+    Recording only the former left every option order in the journal at $0.00, since none of
+    them is a market order, so the panel could show a size and a direction and nothing else.
+    """
+    from src.data.order_journal import _entry
+
+    resting = _entry("options_flip", "alpaca1", {
+        "symbol": "USO   260916C00142000", "action": "sell", "quantity": 1.0,
+        "status": "submitted", "order_type": "limit", "limit_price": 17.30,
+    }, "now")
+    assert resting["limit_price"] == 17.30 and resting["order_type"] == "limit"
+
+    stop = _entry("options_flip", "alpaca1", {
+        "symbol": "USO   260916C00142000", "action": "sell", "quantity": 1.0,
+        "status": "submitted", "order_type": "stop", "stop_price": 4.42,
+    }, "now")
+    assert stop["stop_price"] == 4.42
+
+    # A market order still records what it was sized from, kept separate from a named price.
+    market = _entry("bursty_dca", "schwab2", {
+        "symbol": "SPYM", "action": "buy", "quantity": 2.0,
+        "status": "submitted", "latest_price": 89.735,
+    }, "now")
+    assert market["price"] == 89.735 and market["limit_price"] == 0.0

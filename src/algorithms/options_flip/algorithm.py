@@ -29,6 +29,7 @@ delta, and how many sessions a position has been held.
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import asdict, replace
 from datetime import date, datetime, time
 from typing import Any
@@ -43,12 +44,12 @@ from ...core.interfaces import (
     Check,
     SignalView,
 )
-from ...core.options import CALL, is_osi_symbol, parse_osi
+from ...core.options import CALL, black_scholes_delta, is_osi_symbol, parse_osi
 from ...data.state_store import algorithm_state_key, save_state
 from ..base import BaseAlgorithm
 from ..rally_rotation.memory import market_day, sessions_since
 from ..reconcile import ORDER_IDS_KEY, reconcile_orders
-from .config import OptionsFlipConfig
+from .config import BUCKETS, MAX_ITEM_AMOUNT, OptionsFlipConfig, raw_plan, sanitize_plan, symbol_budget
 from .contracts import affordable_contracts, fill_missing_deltas, select_contract
 from .candidates import scoring_parameters, trend_strength
 from .indicators import average_true_range, quote_age_seconds
@@ -62,6 +63,13 @@ from .signals import signal_view
 
 logger = logging.getLogger(__name__)
 
+#: What a symbol's bubble starts at when a board is seeded from a config that named no
+#: per-position ceiling. One position's worth, not a portfolio's.
+DEFAULT_SEED_BUDGET = 3_500.0
+
+#: Trading days a year, for annualising a daily volatility estimate.
+TRADING_DAYS_PER_YEAR = 252
+
 REGULAR_OPEN = time(9, 30)
 REGULAR_CLOSE = time(16, 0)
 
@@ -72,7 +80,18 @@ class OptionsFlipAlgorithm(BaseAlgorithm):
     algorithm_id = "options_flip"
     tuning_class = OptionsFlipConfig
 
-    #: Contracts are sized by count against a notional cap, so neither portfolio floor applies.
+    #: Per-symbol dollar budgets are a nested structure rather than a list of scalars, so the
+    #: Tune screen renders them through the same bubble board Bursty DCA uses. The buckets differ
+    #: -- call and put rather than buy and sell -- and the editor keys off ``BUCKETS``.
+    tune_editor = "budgets"
+    tune_buckets = BUCKETS
+    tune_budget_hint = "Dollars per position, per symbol"
+    tune_unit = "currency"
+    tune_max_amount = float(MAX_ITEM_AMOUNT)
+    tune_step = 25.0
+
+    #: Contracts are sized by a per-symbol dollar budget, trimmed by a notional cap, so neither
+    #: portfolio floor applies.
     min_trade_dollars = 0.0
     rebalance_threshold = 0.0
 
@@ -93,27 +112,70 @@ class OptionsFlipAlgorithm(BaseAlgorithm):
     #: stop are doing the actual work.
     cron = "*/5 9-15 * * 1-5"
 
-    @staticmethod
-    def _symbols(cfg: OptionsFlipConfig, config: Any) -> list[str]:
-        """The symbols to run, falling back to the configured universe when none are named.
+    def budget_plan(self, config: Any) -> dict[str, Any]:
+        """The board: which symbols this algorithm trades, and how many contracts of each.
 
-        Resolved in one place because ``requirements`` and ``plan`` must agree: if they disagree
-        the context loads bars for one set and the algorithm iterates another, and the difference
-        shows up as symbols that silently never trade.
+        The board is the whole statement now. There is no separate ``symbols`` list and no
+        global ``contracts_per_trade`` -- a symbol trades because it has a bubble, and it trades
+        the size that bubble carries. Two controls that had to agree became one that cannot
+        disagree with itself.
+
+        A board that has never been saved seeds from the retired ``symbols`` key when the config
+        still carries one, so an existing deployment keeps trading exactly what it traded before
+        rather than silently going quiet on upgrade. That is a migration, not a knob: once the
+        board is saved the key is never read again.
         """
-        named = [str(symbol).upper() for symbol in (cfg.symbols or [])]
-        if named:
-            return named
-        # This algorithm's own list, or the account's tradable universe. Rally Rotation's
-        # configured universe is deliberately *not* consulted: the two run different symbol
-        # lists on different accounts, and reading its section let one strategy's tuning
-        # silently decide the other's candidates. Only its scoring function is borrowed.
-        return [str(s).upper() for s in (getattr(config, "symbols", []) or [])]
+        from ...data.universe import tradable_symbols
+
+        tradable = tradable_symbols(config)
+        board = sanitize_plan(raw_plan(config, self.algorithm_id), tradable)
+        if any(bucket.get("items") for bucket in board.values()):
+            return board
+
+        section = (getattr(config, "algorithm_configs", {}) or {}).get(self.algorithm_id) or {}
+        legacy = [str(symbol).upper() for symbol in (section.get("symbols") or [])]
+        # Each symbol inherits the retired per-position dollar ceiling, which is exactly what a
+        # position was allowed to cost before the board existed -- so an upgraded deployment
+        # keeps trading the same size rather than changing it silently.
+        budget = float(section.get("max_notional_per_trade") or 0.0) or DEFAULT_SEED_BUDGET
+        seeded = [
+            {"symbol": symbol, "amount": budget} for symbol in legacy if symbol in tradable
+        ]
+        if seeded:
+            logger.info(
+                "Options Flip seeded its board from the retired symbols key: %s. Save the Tune "
+                "board to make this explicit; the key is not read once the board exists.",
+                ", ".join(item["symbol"] for item in seeded),
+            )
+        board[CALL] = {"amount": sum(item["amount"] for item in seeded), "items": seeded}
+        return board
+
+    def config_fingerprint(self, config: Any) -> dict[str, Any]:
+        """The board sizes every position, so editing an amount changes what this algorithm
+        would do -- and a cached signal view computed under the old amounts must not be served
+        for the new ones."""
+        return {**super().config_fingerprint(config), "plan": self.budget_plan(config)}
+
+    def _symbols(self, config: Any) -> list[str]:
+        """Every symbol the board funds, in either direction.
+
+        Read from the board so ``requirements`` and ``plan`` cannot disagree. They used to be
+        two lists -- a ``symbols`` knob and the board -- and a symbol on one but not the other
+        either loaded bars nothing iterated or iterated with no bars loaded.
+        """
+        board = self.budget_plan(config)
+        found: list[str] = []
+        for bucket in board.values():
+            for item in bucket.get("items") or []:
+                symbol = str(item.get("symbol", "")).upper()
+                if symbol and symbol not in found:
+                    found.append(symbol)
+        return sorted(found)
 
     def requirements(self, config: Any, current_positions: dict[str, int]) -> AlgorithmRequirements:
         cfg = self.tuning(config)
         return AlgorithmRequirements(
-            price_symbols=self._symbols(cfg, config),
+            price_symbols=self._symbols(config),
             daily_lookback_days=cfg.required_daily_bars,
             daily_ma_days=cfg.regime_slow_ma_days,
             intraday_lookback_minutes=cfg.required_intraday_minutes,
@@ -121,6 +183,9 @@ class OptionsFlipAlgorithm(BaseAlgorithm):
             needs_state=True,
             needs_option_chains=True,
             needs_premarket=True,
+            # The exit prices against what the position actually cost, and a limit buy fills at
+            # or below its price -- so the bid is an upper bound on the cost, never the cost.
+            needs_cost_basis=True,
         )
 
     def plan(self, context: AlgorithmContext) -> AlgorithmPlan:
@@ -129,8 +194,12 @@ class OptionsFlipAlgorithm(BaseAlgorithm):
         symbols_memory = dict(state.get("symbols") or {})
         session = _session_facts(context.timestamp, cfg)
         held = _held_contracts(context.positions)
+        held_counts = _held_quantities(context.positions)
 
-        universe = self._symbols(cfg, context.config)
+        universe = self._symbols(context.config)
+        # Resolved once for the whole run rather than per symbol: it is one read of the config
+        # document, and every symbol must be sized against the same board.
+        plan_board = self.budget_plan(context.config)
         # No ranking, and nothing shared between symbols. Each is scored from its own bars
         # inside ``_plan_one``, so adding or removing a name cannot change what the others do.
         symbols = sorted({*universe, *held}) if universe else sorted(held)
@@ -140,6 +209,8 @@ class OptionsFlipAlgorithm(BaseAlgorithm):
                 symbol, context, cfg, session,
                 memory=dict(symbols_memory.get(symbol) or {}),
                 held_contract=held.get(symbol, ""),
+                held_quantity=held_counts.get(symbol, 0),
+                plan_board=plan_board,
             )
             orders.extend(outcome.orders)
             signals[symbol] = _signal(outcome)
@@ -158,7 +229,7 @@ class OptionsFlipAlgorithm(BaseAlgorithm):
             },
         )
 
-    def _plan_one(self, symbol, context, cfg, session, *, memory, held_contract):
+    def _plan_one(self, symbol, context, cfg, session, *, memory, held_contract, held_quantity=0, plan_board=None):
         """One symbol, start to finish: direction, contract, budget, orders."""
         daily = context.daily_bars_by_symbol.get(symbol)
         intraday = context.intraday_bars_by_symbol.get(symbol)
@@ -188,10 +259,11 @@ class OptionsFlipAlgorithm(BaseAlgorithm):
                 held_contract, context, cfg, session, under_now=underlying_now,
                 delta=delta, mark=mark, under_translation=under_translation,
             )
-            return plan_symbol(
+            outcome = plan_symbol(
                 symbol, memory=memory, held_contract=held_contract,
                 direction=str(memory.get("direction") or ""), contract=None,
-                contracts=int(memory.get("contracts", 1) or 1),
+                # The broker's count, not the remembered intent -- see ``_held_quantities``.
+                contracts=int(held_quantity or memory.get("contracts", 1) or 1),
                 underlying_now=underlying_now,
                 entry_target=0.0,
                 exit_target=exit_level,
@@ -199,6 +271,14 @@ class OptionsFlipAlgorithm(BaseAlgorithm):
                 target_premium=float(band.get("target", 0.0)) or None,
                 sell_ok=sell_ok,
             )
+            # The band re-predicts every run regardless of state, so a held position should not go
+            # dark once it fills -- same estimate shape as the flat/bidding case, below.
+            # ``outcome.memory`` rather than ``memory``: the resting sell order's price is
+            # resolved inside ``plan_symbol`` and written there, so the pre-plan copy has no
+            # ``target`` and the band's far end rendered as $0.00.
+            return replace(outcome, estimate=_held_estimate_row(
+                outcome.memory or memory, band, mark, exit_level, sell_ok,
+            ))
 
         history, today = _split_sessions(intraday, session["market_day"])
         # ── gate 1: is the bull thesis intact today? ──────────────────────────────────
@@ -284,24 +364,28 @@ class OptionsFlipAlgorithm(BaseAlgorithm):
                 spot=underlying_now, config=cfg,
             )
             ceiling = max_debit(priced, outcomes, config=cfg)
-            contracts = affordable_contracts(priced, cfg) if contract else 0
+            budget = symbol_budget(plan_board, symbol, CALL)
+            contracts = affordable_contracts(priced, cfg, budget=budget) if contract else 0
             profit = expected_profit(outcomes, contracts or 1, config=cfg)
             worth_it = profit["per_contract"] >= float(cfg.min_profit_per_contract)
             estimate = _estimate_row(
                 priced, levels, outcomes, profit, ceiling, contracts, regime, cfg,
+                as_of=date.fromisoformat(session["market_day"]),
             )
-            wanted_contracts = max(int(getattr(cfg, "contracts_per_trade", 1) or 1), 1)
-            notional_cap = float(getattr(cfg, "max_notional_per_trade", 0.0) or 0.0)
-            if contract is not None and notional_cap > 0:
+            # What the board funded, and what that bought at today's ask. Reported because the
+            # translation is the one place a budget becomes a position: a symbol funded below
+            # one contract's premium opens nothing, and the reader should see that rather than
+            # an unexplained "no trade".
+            if contract is not None and budget > 0:
                 contract_cost = (contract.ask or contract.midpoint) * 100.0
                 checks = checks + [Check(
                     label="Affordable",
                     ok=contracts > 0,
                     value=(
-                        f"${contract_cost:,.0f}/contract against a ${notional_cap:,.0f} cap "
-                        f"— {contracts} of {wanted_contracts} wanted"
+                        f"${contract_cost:,.0f}/contract against {symbol}'s ${budget:,.0f} "
+                        f"budget — {contracts} contract{'s' if contracts != 1 else ''}"
                     ),
-                    limit=f"≤ ${notional_cap:,.0f} per contract, whole contracts only",
+                    limit=f"≤ ${budget:,.0f}, whole contracts only",
                     blocking=contracts <= 0,
                 )]
             checks = checks + [Check(
@@ -313,11 +397,6 @@ class OptionsFlipAlgorithm(BaseAlgorithm):
                 ),
                 limit=f"≥ ${float(cfg.min_profit_per_contract):,.0f} per contract, gross",
                 blocking=not worth_it,
-            ), Check(
-                label="Max debit",
-                ok=ceiling > 0,
-                value=f"${ceiling:.2f} — the entry limit is never raised past this",
-                limit="derived from the base case, not chosen",
             )]
             if not worth_it:
                 contracts = 0
@@ -363,17 +442,6 @@ class OptionsFlipAlgorithm(BaseAlgorithm):
                 under_translation=under_translation,
             )
             band_source = str(band.get("source") or "none")
-            checks = checks + [Check(
-                label="Option band",
-                ok=True,
-                value=(
-                    f"entry ${float(band.get('entry', 0.0)):.2f} → "
-                    f"${float(band.get('target', 0.0)):.2f} from "
-                    + ("the premium's own history" if band_source == "option" else "the underlying")
-                    + f" ({int(band.get('sample', 0))} sessions)"
-                ),
-                limit="this contract's own low and run, in premium; absurds fall back",
-            )]
             if estimate:
                 # What the resting bid is actually priced from -- the band's own entry, which is
                 # the translation whenever the option's own history was too thin or too absurd to
@@ -381,6 +449,9 @@ class OptionsFlipAlgorithm(BaseAlgorithm):
                 # time. Reporting the translation here regardless of ``band_source`` would show a
                 # number the order never used.
                 estimate["entry_premium"] = float(band.get("entry", 0.0))
+                # The far end as well, so the premium band has both ends. Only the entry was
+                # carried, which rendered as "$16.56 -> $0.00".
+                estimate["target_premium"] = float(band.get("target", 0.0) or 0.0)
                 estimate["band_source"] = band_source
                 estimate["band_sample"] = int(band.get("sample", 0))
 
@@ -422,13 +493,33 @@ class OptionsFlipAlgorithm(BaseAlgorithm):
         run which correctly did nothing, and which a cron would otherwise lose on every quiet
         fire. (Rally Rotation has the opposite bug for the same reason: its eligibility window is
         empty because dashboard previews never reach ``execute``.)
+
+        Order ids are written *as the reconciler places them*, not once it returns. A broker
+        error partway through leaves the orders it already placed live at the broker, and ids
+        that only landed on a clean return would be lost with the exception -- so the next run
+        would read empty state and submit the whole book again.
         """
         state = dict(plan.state or {})
-        outcome = reconcile_orders(
-            plan.desired_orders, brokerage, dict(state.get(ORDER_IDS_KEY) or {})
-        )
+        state_key = algorithm_state_key(self.algorithm_id, getattr(config, "account_id", ""))
+
+        def persist(order_ids: dict[str, str]) -> None:
+            state[ORDER_IDS_KEY] = order_ids
+            save_state(state_key, state)
+
+        try:
+            outcome = reconcile_orders(
+                plan.desired_orders,
+                brokerage,
+                dict(state.get(ORDER_IDS_KEY) or {}),
+                persist=persist,
+            )
+        except Exception:
+            # Whatever ``persist`` last wrote stands: it names every order that reached the
+            # broker before the failure, which is exactly what the next run needs to pick up.
+            logger.exception("Order reconciliation failed; recorded order ids are up to date")
+            raise
         state[ORDER_IDS_KEY] = outcome["order_ids"]
-        save_state(algorithm_state_key(self.algorithm_id, getattr(config, "account_id", "")), state)
+        save_state(state_key, state)
         return {
             "strategy": plan.strategy,
             "mode": "lifecycle",
@@ -480,6 +571,27 @@ def _session_facts(now: datetime, cfg: OptionsFlipConfig) -> dict[str, Any]:
 def _parse_time(value: str) -> time:
     hour, _, minute = str(value or "").partition(":")
     return time(int(hour or 0), int(minute or 0))
+
+
+def _held_quantities(positions: dict[str, Any]) -> dict[str, int]:
+    """Contracts actually held, keyed by underlying.
+
+    The broker's own count, which is the only number an exit may be sized from: a partial fill,
+    a hand-trimmed position or one opened outside this algorithm all leave the remembered
+    intent saying something the account does not hold. Sizing the sell from memory produced an
+    order the broker rejects -- and a rejected exit is an open position with no protection
+    resting against it at all.
+    """
+    held: dict[str, int] = {}
+    for symbol, quantity in (positions or {}).items():
+        count = int(float(quantity or 0))
+        if count <= 0 or not is_osi_symbol(symbol):
+            continue
+        try:
+            held[parse_osi(symbol)["underlying"]] = count
+        except ValueError:
+            continue
+    return held
 
 
 def _held_contracts(positions: dict[str, Any]) -> dict[str, str]:
@@ -544,7 +656,7 @@ def _pick_contract(context, symbol, direction, session, cfg, spot=0.0, annual_vo
             label="Option chain available",
             ok=False,
             value="no chain provider bound",
-            limit="required to choose a contract",
+            limit="a chain to choose a contract from",
             blocking=True,
         )]
     try:
@@ -553,7 +665,7 @@ def _pick_contract(context, symbol, direction, session, cfg, spot=0.0, annual_vo
         logger.warning("Options Flip could not read the chain for %s: %s", symbol, exc)
         return None, None, [Check(
             label="Option chain available",
-            ok=False, value=str(exc)[:80], limit="chain request succeeded", blocking=True,
+            ok=False, value=str(exc)[:80], limit="a chain the provider could return", blocking=True,
         )]
     as_of = datetime.fromisoformat(session["market_day"]).date()
     chain, estimated = fill_missing_deltas(
@@ -565,8 +677,11 @@ def _pick_contract(context, symbol, direction, session, cfg, spot=0.0, annual_vo
         checks = [Check(
             label="Greeks estimated",
             ok=True,
-            value="the chain returned none; delta computed from realised volatility",
-            limit="provider greeks preferred",
+            value=(
+                "the chain returned none; delta computed from realised volatility "
+                "(a provider greek is preferred when one is quoted)"
+            ),
+            gate=False,
         )] + checks
     return best, candidate, checks
 
@@ -609,9 +724,8 @@ def _estimate(
     low, high = round(entry, 2), round(exit_price, 2)
     return {
         "contract": contract.osi_symbol,
-        "contract_label": (
-            f"${contract.strike:g} {contract.option_type} · {contract.expiry:%d %b}"
-            f" · {contract.dte(as_of)}d · delta {contract.delta:.2f}"
+        "contract_label": _contract_label(
+            contract.strike, contract.option_type, contract.expiry, contract.delta
         ),
         "strike": contract.strike,
         "expiry": contract.expiry.isoformat(),
@@ -676,7 +790,9 @@ def _decision_minute(session: dict[str, Any], cfg: Any) -> int:
     return max(min(int(session.get("minute") or first_fire), cutoff), first_fire)
 
 
-def _estimate_row(contract, levels, outcomes, profit, ceiling, contracts, regime, cfg) -> dict[str, Any]:
+def _estimate_row(
+    contract, levels, outcomes, profit, ceiling, contracts, regime, cfg, *, as_of: date,
+) -> dict[str, Any]:
     """What the deck needs to judge the setup, on the days it trades and the days it does not.
 
     Every field is reported whether or not an order goes out. "No trade today" says nothing about
@@ -685,9 +801,12 @@ def _estimate_row(contract, levels, outcomes, profit, ceiling, contracts, regime
     """
     return {
         "contract": contract.osi_symbol,
-        "contract_label": (
-            f"${contract.strike:g} {contract.option_type} · {contract.expiry:%d %b} · "
-            f"delta {contract.delta:+.2f}"
+        # Built by the shared helper so a candidate and a held position read identically.
+        # Open interest and the quoted spread are deliberately absent: they are the *gates*
+        # "Liquid enough to trade" measures, and the panel already reports both against their
+        # thresholds. Repeating them on the row said the same thing without the threshold.
+        "contract_label": _contract_label(
+            contract.strike, contract.option_type, contract.expiry, contract.delta
         ),
         "mark": contract.midpoint,
         "spread_pct": contract.spread_pct,
@@ -705,6 +824,63 @@ def _estimate_row(contract, levels, outcomes, profit, ceiling, contracts, regime
         "vwap": regime.get("vwap", 0.0),
         "gap_atr": regime.get("gap_atr", 0.0),
         "volume_imbalance": regime.get("volume_imbalance", 0.0),
+    }
+
+
+def _contract_label(strike: float, option_type: str, expiry, delta: float) -> str:
+    """One contract's name, in the terms a reader judges it by rather than as an OSI string.
+
+    Shared so a held position and a candidate read identically. A held row used to print the
+    raw ``USO   260916C00142000`` because its contract object is gone once the chain stops
+    being fetched -- but every field in the label is recoverable from the symbol itself, and
+    the delta is re-derived each run anyway.
+    """
+    label = f"${strike:g} {option_type} · {expiry:%d %b}"
+    return f"{label} · delta {delta:+.2f}" if delta else label
+
+
+def _held_estimate_row(memory, band, mark: float, exit_level: float, sell_ok: bool) -> dict[str, Any]:
+    """What the deck needs to judge a held position, refreshed every run like the flat estimate.
+
+    Two bands, because a held position is priced in two currencies and the reader needs both.
+    The *premium* band is what the position is actually doing -- what it cost and what the
+    resting sell order is asking right now -- and it is the one that belongs beside the mark.
+    The *underlying* band is where that ask comes from: the level model's target for the stock,
+    translated into premium through delta.
+
+    This used to report the underlying band alone, against an entry hardcoded to zero because a
+    held position has no entry left to make. That rendered as "$0.00 -> $161.01" next to a
+    $7.20 mark -- an underlying-scale number in a field the reader reads as premium, with a
+    placeholder for its other end.
+    """
+    fill_price = float(memory.get("fill_price", 0.0) or 0.0)
+    # The resting sell order's price, as this run resolved it -- not the modelled ceiling. That
+    # is what the position is asking, so it is what the band's far end should say.
+    asking = float(memory.get("target", 0.0) or 0.0)
+    contracts = max(int(memory.get("contracts", 1) or 1), 1)
+    return {
+        "contract": str(memory.get("contract", "")),
+        "contract_label": _held_contract_label(memory),
+        "fill_price": fill_price,
+        "mark": mark,
+        "unrealised_pct": (mark / fill_price - 1.0) if fill_price > 0 and mark > 0 else 0.0,
+        # The premium band: what it cost, and what it is asking.
+        "entry_premium": fill_price,
+        "target_premium": asking or float(band.get("target", 0.0) or 0.0),
+        # The underlying band behind it. ``entry_underlying`` is deliberately the price now
+        # rather than zero: for a held position the interesting span is from here to the target.
+        "entry_underlying": float(memory.get("underlying_now", 0.0) or 0.0),
+        "target_underlying": exit_level,
+        # What the resting sell order is worth against what the position cost, gross, for the
+        # whole position -- the same reading as the flat row's, which prices the modelled move
+        # for the contracts it would open. Reported rather than omitted: "what do I make if
+        # this target fills" is the question a held row exists to answer.
+        "expected_profit": max(asking - fill_price, 0.0) * 100.0 * contracts,
+        "band_source": str(band.get("source") or "none"),
+        "band_sample": int(band.get("sample", 0)),
+        "sell_ok": sell_ok,
+        "sessions_held": int(memory.get("sessions_held", 0) or 0),
+        "gate_failed_streak": int(memory.get("gate_failed_streak", 0) or 0),
     }
 
 
@@ -799,8 +975,12 @@ def _sell_ok(daily, today, price: float, cfg) -> bool:
     ``_plan_one`` short-circuits before the entry gates for a held position, so the regime has to
     be checked here rather than assumed -- a position's bracket must not keep asking a premium
     target the market is no longer expected to pay.
+
+    ``for_exit=True`` -- only the multi-day trend (``Above the trend``) can close this gate here;
+    same-day noise (``Holding VWAP``, ``Open not a gap down``) is reported but not acted on. See
+    ``bull_regime``'s docstring for the measured reason.
     """
-    eligible, _, _ = bull_regime(daily, today, price=price, config=cfg)
+    eligible, _, _ = bull_regime(daily, today, price=price, config=cfg, for_exit=True)
     return bool(eligible)
 
 
@@ -817,14 +997,23 @@ def _refresh_held(memory, held_contract, context, session, cfg) -> dict[str, Any
     mark = float(context.latest_prices.get(held_contract, 0.0) or 0.0)
     if mark > 0:
         memory["mark"] = mark
-    if not memory.get("fill_price"):
-        # Opened outside this algorithm, or state was lost. The mark is the only anchor left, and
-        # anchoring the stop to it is conservative: it sets the floor from here rather than
-        # pretending to know a cost basis we do not have.
+    # The broker's own average entry price, which is the only account of what this position
+    # actually cost. Recorded on every run rather than only when missing, so a partial fill or a
+    # second lot -- both of which move the average -- are picked up rather than frozen at
+    # whatever the first run saw.
+    broker_cost = float((context.cost_basis or {}).get(held_contract, 0.0) or 0.0)
+    if broker_cost > 0:
+        memory["fill_price"] = broker_cost
+    elif not memory.get("fill_price"):
+        # No cost basis and nothing remembered: opened outside this algorithm, state was lost, or
+        # the brokerage cannot report one. The mark is the only anchor left, and anchoring the
+        # stop to it is conservative only while the mark sits below the true cost -- so this is a
+        # fallback worth seeing in the log rather than a normal path.
         memory["fill_price"] = mark
         memory.setdefault("filled_day", session["market_day"])
         logger.warning(
-            "Options Flip found %s held with no recorded fill; anchoring the stop to the mark",
+            "Options Flip found %s held with no cost basis from the broker and no recorded "
+            "fill; anchoring the stop to the mark instead",
             held_contract,
         )
     filled_day = str(memory.get("filled_day") or session["market_day"])
@@ -833,8 +1022,92 @@ def _refresh_held(memory, held_contract, context, session, cfg) -> dict[str, Any
         memory["sessions_held"] = sessions_since(filled_day, datetime.fromisoformat(session["market_day"]))
     except ValueError:
         memory["sessions_held"] = 0
+    # Delta is re-derived every run, not carried from the fill.
+    #
+    # It translates an underlying target into a premium one, and it is not a property of the
+    # trade -- it is a property of where the underlying sits *now*. A USO 142 call six days out
+    # is delta 0.90 at spot 150 and delta 0.10 at spot 134, so a delta frozen at entry
+    # overstates the target premium by 4% while the trade works and by 373% once it has gone
+    # badly wrong. That error runs the dangerous way: the position asks an impossible price
+    # exactly when it should be conceding, and the deadline is then the only thing that closes
+    # it. Derived from the contract's terms and the underlying's realised volatility -- the
+    # same Black-Scholes fallback ``fill_missing_deltas`` uses when Schwab will not quote one,
+    # and the only route available here, since a held symbol's chain is no longer fetched.
+    previous = float(memory.get("delta", 0.0) or 0.0)
+    current = _recover_delta(held_contract, context, session, cfg)
+    if current:
+        memory["delta"] = current
+        if previous and abs(current - previous) > 0.05:
+            logger.info(
+                "Options Flip re-priced %s delta %.3f -> %.3f as the underlying moved",
+                held_contract, previous, current,
+            )
+    elif not previous:
+        logger.warning(
+            "Options Flip has no delta for %s and could not derive one; its exit target will "
+            "sit at the mark until the underlying can be priced",
+            held_contract,
+        )
+    memory["underlying_now"] = _underlying_price(held_contract, context)
     memory["state"] = HELD
     return memory
+
+
+def _held_contract_label(memory: dict[str, Any]) -> str:
+    """The held contract's label, rebuilt from its OSI symbol when the chain is long gone."""
+    osi = str(memory.get("contract", ""))
+    try:
+        parsed = parse_osi(osi)
+    except Exception:  # noqa: BLE001 - an unreadable symbol is its own best label
+        return osi
+    return _contract_label(
+        float(parsed["strike"]), str(parsed["option_type"]), parsed["expiry"],
+        float(memory.get("delta", 0.0) or 0.0),
+    )
+
+
+def _underlying_price(osi: str, context) -> float:
+    """The held contract's underlying price, for the deck's underlying band."""
+    try:
+        underlying = str(parse_osi(osi)["underlying"]).upper()
+    except Exception:  # noqa: BLE001 - an unreadable symbol has no underlying to price
+        return 0.0
+    return float((getattr(context, "latest_prices", None) or {}).get(underlying, 0.0) or 0.0)
+
+
+def _recover_delta(osi: str, context, session, cfg) -> float:
+    """Black-Scholes delta for a held contract whose stored one is missing.
+
+    Priced off the underlying's own realised volatility over ``volatility_window`` sessions,
+    which is what the contract-selection path falls back to as well, so a recovered delta and a
+    freshly quoted one mean the same thing.
+    """
+    try:
+        parsed = parse_osi(osi)
+    except Exception:  # noqa: BLE001 - an unreadable symbol simply has no delta to recover
+        return 0.0
+    underlying = str(parsed["underlying"]).upper()
+    # Read defensively: recovery is a best-effort repair, so a context that cannot answer
+    # leaves the delta missing rather than failing the run.
+    spot = float((getattr(context, "latest_prices", None) or {}).get(underlying, 0.0) or 0.0)
+    daily = (getattr(context, "daily_bars_by_symbol", None) or {}).get(underlying)
+    if spot <= 0 or daily is None or getattr(daily, "empty", True):
+        return 0.0
+    closes = daily["close"].astype(float)
+    window = max(int(cfg.volatility_window), 2)
+    returns = closes.pct_change().dropna().tail(window)
+    if returns.empty:
+        return 0.0
+    annual_vol = float(returns.std()) * math.sqrt(TRADING_DAYS_PER_YEAR)
+    if annual_vol <= 0:
+        return 0.0
+    market_day = date.fromisoformat(session["market_day"])
+    years = max((parsed["expiry"] - market_day).days, 0) / 365.0
+    if years <= 0:
+        return 0.0
+    return float(black_scholes_delta(
+        spot, float(parsed["strike"]), years, annual_vol, str(parsed["option_type"])
+    ))
 
 
 def _signal(outcome) -> dict[str, Any]:

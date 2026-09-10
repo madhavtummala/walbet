@@ -114,17 +114,6 @@ def select_contract(
                     + (f", spread ≤ {max_spread:.1%}" if max_spread > 0 else "")
                 ),
             ))
-            checks.append(Check(
-                label="Contract chosen",
-                ok=True,
-                value=(
-                    f"{best.osi_symbol} — ${best.strike:g} {best.option_type}, "
-                    f"delta {best.delta:+.2f}, {best.dte(as_of)}d, "
-                    f"vol {best.volume}, OI {best.open_interest}, "
-                    f"{best.bid:.2f}/{best.ask:.2f} ({best.spread_pct:.1%} wide)"
-                ),
-                limit=f"nearest delta {target:+.2f}, then volume",
-            ))
             return best, candidate, checks
 
     # Nothing anywhere in the window cleared both filters.
@@ -149,17 +138,22 @@ def select_contract(
     return None, best_effort, checks
 
 
-def affordable_contracts(contract: OptionContract, config: Any) -> int:
-    """How many contracts the per-trade notional cap allows, at this contract's ask.
+def affordable_contracts(
+    contract: OptionContract, config: Any, *, budget: float = 0.0
+) -> int:
+    """How many whole contracts ``budget`` buys, at this contract's ask.
 
-    Priced at the ask rather than the mid because the cap is a statement about money that could
-    actually leave the account, and a marketable order pays the offer.
+    Priced at the ask rather than the mid because the budget is a statement about money that
+    could actually leave the account, and a marketable order pays the offer.
 
-    ``contracts_per_trade`` is the unit and the cap only ever *trims* it, so the two say
-    different things rather than the same thing twice: the unit is the risk you intend to take
-    and the cap is the money you refuse to exceed. A cap of zero means no cap, deliberately --
-    on an expensive underlying a cap set for a cheap one rejects every contract, and the
-    strategy then looks broken rather than priced out.
+    One number decides the size. There used to be two -- a contract unit and a global dollar
+    ceiling that trimmed it -- which said the same thing twice and disagreed whenever premium
+    moved: the same unit was inside the ceiling one session and trimmed the next, so the size
+    you configured was not the size you got. A per-symbol dollar budget says everything the
+    global ceiling could, per symbol rather than once for all of them.
+
+    A symbol with no budget opens nothing. That is the board being the whole statement of what
+    this algorithm may trade: no bubble, no position.
 
     Whole contracts because no venue sells a fraction of one.
     """
@@ -171,13 +165,7 @@ def affordable_contracts(contract: OptionContract, config: Any) -> int:
     cost = (contract.ask or contract.midpoint) * 100.0
     if cost <= 0:
         return 0
-    wanted = max(int(getattr(config, "contracts_per_trade", 1) or 1), 1)
-    cap = float(getattr(config, "max_notional_per_trade", 0.0) or 0.0)
-    # A cap of zero means "no cap" -- deliberately, because on an expensive underlying the cap
-    # rejects every contract and the strategy looks broken rather than priced out.
-    if cap <= 0:
-        return wanted
-    return max(min(wanted, int(cap // cost)), 0)
+    return max(int(max(float(budget or 0.0), 0.0) // cost), 0)
 
 
 def fill_missing_deltas(

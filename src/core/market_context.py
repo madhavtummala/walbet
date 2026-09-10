@@ -15,6 +15,7 @@ from src.connectors import (
     fetch_market_history,
 )
 from src.core.interfaces import AlgorithmContext
+from src.core.options import is_osi_symbol
 from src.data import fetch_daily_bars
 from src.data.state_store import algorithm_state_key, load_state
 
@@ -229,6 +230,7 @@ def build_algorithm_context(
     *,
     algorithm_id: str = "",
     positions: dict[str, int] | None = None,
+    cost_basis: dict[str, float] | None = None,
     equity: float = 0.0,
     data_client: Any = None,
     source: ContextSource | None = None,
@@ -250,13 +252,22 @@ def build_algorithm_context(
     price_symbols = sorted(set(requirements.price_symbols or config.symbols) | set(positions))
     latest_prices = source.latest_prices(price_symbols, config)
 
+    # Bars are fetched for the symbols that *have* bars. A held option contract arrives here
+    # through ``positions`` and needs a mark -- the lifecycle prices its exit against it -- but
+    # no equity bar provider carries an OSI symbol. Asking anyway walked the whole provider
+    # waterfall per contract: Schwab reported it uncovered, yfinance looked it up as a delisted
+    # ticker and failed, and one held position added roughly eight seconds to every run, on a
+    # request the dashboard gives up on. Chain quotes and the contract's own price history are
+    # fetched separately, through ``capabilities``.
+    bar_symbols = [symbol for symbol in price_symbols if not is_osi_symbol(symbol)]
+
     daily_bars_by_symbol: dict[str, Any] = {}
     if requirements.daily_lookback_days:
-        daily_bars_by_symbol = source.daily_bars(price_symbols, requirements, config)
+        daily_bars_by_symbol = source.daily_bars(bar_symbols, requirements, config)
 
     intraday_bars_by_symbol: dict[str, Any] = {}
     if requirements.intraday_lookback_minutes:
-        intraday_bars_by_symbol = source.intraday_bars(price_symbols, requirements, config)
+        intraday_bars_by_symbol = source.intraday_bars(bar_symbols, requirements, config)
 
     sentiment_scores: dict[str, float] = {}
     market_sentiment = 0.0
@@ -278,6 +289,7 @@ def build_algorithm_context(
         sentiment_scores=sentiment_scores,
         market_sentiment=market_sentiment,
         positions=positions,
+        cost_basis=dict(cost_basis or {}),
         latest_prices=latest_prices,
         equity=equity,
         account_id=getattr(config, "account_id", ""),
