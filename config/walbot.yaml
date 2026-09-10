@@ -184,12 +184,14 @@ algorithms:
     max_annual_volatility: 0.8
     plan:
       call:
-        amount: 500
+        amount: 2000
         items:
-        - symbol: USO
-          amount: 250
         - symbol: IBIT
-          amount: 250
+          amount: 500
+        - symbol: USO
+          amount: 500
+        - symbol: GLD
+          amount: 1000
       put:
         amount: 0
         items: []
