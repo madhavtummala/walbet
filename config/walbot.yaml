@@ -55,6 +55,7 @@ tradable_universe:
   - GLD
   - GPIX
   - GTEK
+  - GUMI
   - HYG
   - IAUM
   - IBIT
@@ -110,7 +111,7 @@ algorithm_bot:
     strategy: options_flip
     account_id: alpaca1
     enabled: false
-    cron: '*/5 10-15 * * 1-5'
+    cron: 2/10 10-15 * * 1-5
   enabled: false
 algorithms:
   bursty_dca:
@@ -166,23 +167,23 @@ algorithms:
     macro_days: 20
   options_flip:
     symbols:
-    - XSD
+    - USO
     - IBIT
     - GLD
     contracts_per_trade: 1
     stop_loss_pct: 0.5
     max_hold_sessions: 6
-    exit_gain_share: 0.7
-    exit_reach: 0.35
-    exit_patience: 1.5
-    entry_reach: 0.4
-    entry_patience: 2.0
-    min_profit_per_contract: 15
     target_delta: 0.8
+    entry_reach: 0.4
+    exit_reach: 0.35
+    entry_patience: 2
+    exit_patience: 1.5
+    exit_gain_share: 0.7
+    min_profit_per_contract: 15
     level_lookback_days: 80
     min_trend_strength: 0.5
     max_notional_per_trade: 3500
-    min_dte: 7
+    min_dte: 10
     min_open_interest: 100
     max_spread_pct: 0.06
     max_gap_down_atr: 1
