@@ -23,7 +23,7 @@ def _config_fields(algorithm_id: str) -> set[str]:
     """
     from dataclasses import fields
 
-    from src.algorithms.bursty_dca.config import PLAN_KEY
+    from src.common.config_utils import PLAN_KEY
     from src.algorithms.bursty_dca.config import BurstyConfig
     from src.algorithms.rally_rotation.config import RallyRotationConfig
     from src.algorithms.registry import get_algorithm_class
@@ -128,3 +128,57 @@ def test_the_prose_does_not_describe_knobs_that_no_longer_exist(algorithm_id: st
     assert not stale, (
         f"{algorithm_id} prose names knobs the algorithm does not read: {sorted(stale)}"
     )
+
+
+def test_every_knob_says_which_way_to_turn_it() -> None:
+    """A reader on the Tune page is deciding whether to raise or lower a number, so that is
+    what the guidance has to answer.
+
+    Twenty-two knobs described what the setting *was* without saying what moving it does --
+    "Half the selection weight sits here", "Stops trivial orders" -- which is true and
+    unactionable. Eight more spent their space on why the current default was chosen, which
+    belongs in the source beside the value, not on a page someone opens to change it.
+    """
+    from src.algorithms.explainers import EXPLAINERS
+
+    directional = (
+        "higher", "lower", "longer", "shorter", "raise", "more", "less", "tighter", "wider",
+        "above", "below", "0 ", "zero", "at 1", "on,", "off", "deeper", "easier", "harder",
+        "one is", "whichever", "set it",
+    )
+    history = ("replaced", "earlier default", "used to", "previously", "the old ")
+
+    for algorithm, entry in EXPLAINERS.items():
+        for knob, doc in entry["parameters"].items():
+            effect = doc["effect"].lower()
+            assert any(word in effect for word in directional), (
+                f"{algorithm}.{knob} does not say which way to turn it"
+            )
+            assert not any(word in effect for word in history), (
+                f"{algorithm}.{knob} explains its own history rather than its effect"
+            )
+            assert len(doc["effect"].split()) <= 50, f"{algorithm}.{knob} runs long"
+            assert len(doc["what"].split()) <= 30, f"{algorithm}.{knob}'s 'what' runs long"
+
+
+def test_a_knob_shared_by_two_algorithms_describes_each_one() -> None:
+    """``plan`` exists in both Bursty DCA and Options Flip and means different things -- a
+    monthly budget in one, a per-position budget in the other.
+
+    A bulk edit keyed on the knob name alone rewrote the first match twice, so DCA's monthly
+    budget was briefly documented as buying option contracts. Guidance for a shared name has to
+    be written per algorithm, and the giveaway is vocabulary from the wrong one.
+    """
+    from src.algorithms.explainers import EXPLAINERS
+
+    vocabulary = {
+        "bursty_dca": ("contract", "premium", "delta", "expiry"),
+        "options_flip": ("monthly", "accrue", "backlog"),
+    }
+    for algorithm, foreign in vocabulary.items():
+        for knob, doc in EXPLAINERS[algorithm]["parameters"].items():
+            text = f"{doc['what']} {doc['effect']}".lower()
+            for word in foreign:
+                assert word not in text, (
+                    f"{algorithm}.{knob} uses {word!r}, which belongs to a different algorithm"
+                )

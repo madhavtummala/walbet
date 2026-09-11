@@ -14,19 +14,19 @@ from src.api.controls import (
     ORIGIN_MCP,
     binding_driver,
     binding_refusal,
-    find_binding,
     load_controls,
     resolve_binding_for_origin,
 )
 from src.core.config import get_config
-from src.core.interfaces import MODE_TARGET, AlgorithmPlan, DesiredOrder, Intent, OrderRequest
+from src.core.interfaces import AlgorithmPlan, OrderRequest
 from src.core.pipeline import (
     TradingRefused,
     UnknownBrokerageError,
     assert_account_tradable,
-    read_snapshot,
     resolve_brokerage,
 )
+from src.core.plan_cache import PlanUnavailable, claim, stash
+from src.core.plan_edits import PlanEditRefused, apply_edits
 from src.core.runner import execute_algorithm, run_algorithm
 from src.data.order_journal import record_orders
 
@@ -55,26 +55,13 @@ def _order_request_payload(request: OrderRequest) -> dict[str, Any]:
     }
 
 
-def _order_request_from_payload(payload: dict[str, Any]) -> OrderRequest:
-    return OrderRequest(
-        symbol=str(payload["symbol"]), action=str(payload["action"]),
-        quantity=float(payload["quantity"]),
-        order_type=str(payload.get("order_type") or "market"),
-        limit_price=payload.get("limit_price"), stop_price=payload.get("stop_price"),
-        client_order_id=payload.get("client_order_id"),
-        time_in_force=str(payload.get("time_in_force") or "day"),
-        asset_type=str(payload.get("asset_type") or "equity"),
-        strategy=str(payload.get("strategy") or "single"),
-        children=tuple(_order_request_from_payload(child) for child in (payload.get("children") or [])),
-        extra=dict(payload.get("extra") or {}),
-    )
-
-
 def _plan_payload(plan: AlgorithmPlan) -> dict[str, Any]:
     """Serialise a plan for the agent, keeping only what review and execution need.
 
-    ``state`` rides along opaquely. The agent has no business reading an accrued budget, but
-    it has to hand it back untouched: the plan it returns is the plan that gets committed.
+    Review only. Nothing here is read back: ``place_orders`` takes a token and uses the plan
+    this was serialised from, so these fields inform the agent's judgement and cannot alter what
+    executes. ``state`` rides along opaquely for the same reason it always did -- the agent has
+    no business reading an accrued budget -- but it can no longer be edited on the way back.
 
     ``signals`` is passed through whole rather than through a fixed key list. It used to
     whitelist Rally Rotation's own shape (``score``/``reason``/``signal``/...), which silently
@@ -85,11 +72,8 @@ def _plan_payload(plan: AlgorithmPlan) -> dict[str, Any]:
     _signal``, ``rally_rotation``'s own row builder), so there is nothing left to filter.
 
     ``desired_orders`` carries an order-book algorithm's actual proposal -- the resting
-    buy/sell/stop legs Options Flip's ``plan()`` builds instead of ``intents``. Omitting it here
-    was a real bug, not a simplification: ``place_orders`` rebuilds an ``AlgorithmPlan`` from
-    whatever the agent sends back, and a plan rebuilt with no ``desired_orders`` reconciles
-    against an empty wanted-set, which cancels every order the position currently has resting
-    at the broker (a live stop and target included) and replaces them with nothing.
+    buy/sell/stop legs Options Flip's ``plan()`` builds instead of ``intents``. It is here so
+    the agent can see what would rest at the broker; reconciliation reads the held plan.
     """
     return {
         "strategy": plan.strategy,
@@ -112,31 +96,6 @@ def _plan_payload(plan: AlgorithmPlan) -> dict[str, Any]:
         "allocation_mode": plan.metadata.get("allocation_mode"),
         "state": plan.state,
     }
-
-
-def _plan_from_payload(payload: dict[str, Any]) -> AlgorithmPlan:
-    """Rebuild a plan from the payload the agent was given, edits included."""
-    return AlgorithmPlan(
-        strategy=str(payload.get("strategy") or DEFAULT_ALGORITHM),
-        intents=[
-            Intent(symbol=str(row["symbol"]).upper(), kind=str(row.get("kind") or "weight"), value=float(row["value"]))
-            for row in (payload.get("intents") or [])
-        ],
-        desired_orders=[
-            DesiredOrder(
-                key=str(row["key"]),
-                request=_order_request_from_payload(row["request"]),
-                replace_tolerance=float(row.get("replace_tolerance") or 0.0),
-            )
-            for row in (payload.get("desired_orders") or [])
-        ],
-        signals=payload.get("signals") or {},
-        latest_prices={str(k).upper(): float(v) for k, v in (payload.get("latest_prices") or {}).items()},
-        metadata={"allocation_mode": payload.get("allocation_mode")},
-        mode=str(payload.get("mode") or MODE_TARGET),
-        as_of=datetime.fromisoformat(payload["as_of"]) if payload.get("as_of") else datetime.now(timezone.utc),
-        state=payload.get("state") or {},
-    )
 
 
 def _server(name: str, host: str, port: int):
@@ -209,8 +168,10 @@ def create_mcp_server(host: str = "0.0.0.0", port: int = 8001):
           ``checks`` (each gate, pass/fail and why), ``estimate`` (the band prediction and
           greeks-priced profit), and ``contract``/``state``/``headline``.
 
-        Pass the whole payload back to place_orders unchanged, or edited -- it carries the
-        prices and the state that step needs regardless of which proposal shape it holds.
+        Returns a ``plan_token``. Review the plan, then pass *only* that token to place_orders;
+        the plan itself stays on this side and is never sent back. It expires in about a minute
+        and a half, and is good for one submission -- an expired token is a normal outcome, not
+        a fault: call this again and review the fresh plan.
 
         Deliberately runs whatever it is asked to, switched on or not: computing a plan is the
         same read-only act as a backtest, and "what would this do right now" is worth answering
@@ -232,56 +193,102 @@ def create_mcp_server(host: str = "0.0.0.0", port: int = 8001):
         }
         if config.kill_switch:
             return {"strategy": algorithm, "status": "error", **context, "reason": "Kill switch is enabled"}
-        return {"status": "ok", **context, **_plan_payload(run_algorithm(algorithm, config))}
+        plan = run_algorithm(algorithm, config)
+        # Held here rather than round-tripped through the agent, so the plan that executes is
+        # the plan that was reviewed. The token is the only part of this payload place_orders
+        # reads back; everything else is for the agent to form a judgement on.
+        token = stash(plan, binding_id=context["binding_id"], account_id=config.account_id)
+        return {"status": "ok", **context, "plan_token": token, **_plan_payload(plan)}
 
     @mcp.tool()
-    def get_current_positions(binding_id: str = "") -> dict[str, Any]:
-        """Return the live holdings reported by the brokerage, with equity and cash.
+    def list_accounts() -> dict[str, Any]:
+        """Name every configured account. Start here, then ask the other two tools per account.
 
-        Reports the default account unless ``binding_id`` names one, which matters as soon as
-        more than one account is configured -- see list_bindings.
+        Cheap and money-free: ids, labels, broker, and ``deployments`` (the algorithms bound to
+        each). Reading a portfolio is this list plus one get_account call per row -- fanned out
+        this way rather than as one all-accounts call so a slow or unreachable broker costs you
+        that account and not the answer.
         """
-        binding = find_binding(load_controls(), binding_id) if binding_id else None
-        if binding_id and binding is None:
-            return {"status": "error", "reason": f"No binding with id {binding_id!r}"}
-        config = get_config(account_id=(binding or {}).get("account_id") or None)
-        try:
-            brokerage = resolve_brokerage(config)
-        except UnknownBrokerageError as exc:
-            return {"status": "error", "reason": str(exc)}
+        from src.api.payloads.accounts import accounts_payload
 
-        account_state = brokerage.get_account_state()
-        snapshot = read_snapshot(config, brokerage)
+        payload = accounts_payload()
         return {
             "status": "ok",
-            "account_id": config.account_id,
-            "updated_at": datetime.now(timezone.utc).isoformat(),
-            "equity": snapshot.equity,
-            "cash": float(account_state.get("cash", 0.0)),
-            "buying_power": float(account_state.get("buying_power", 0.0)),
-            "positions": [
-                {"symbol": symbol, "shares": shares}
-                for symbol, shares in sorted(snapshot.positions.items())
+            "default_account": payload["default"],
+            "accounts": [
+                {k: row[k] for k in ("id", "label", "broker", "deployments", "credentials_ready")}
+                for row in payload["rows"]
             ],
         }
 
     @mcp.tool()
-    def place_orders(algorithm_plan: dict[str, Any], binding_id: str = "") -> dict[str, Any]:
-        """Submit orders for a reviewed plan. The response shape depends on the plan's own shape.
+    def get_account(account_id: str = "") -> dict[str, Any]:
+        """Holdings, cash and P/L for one account. Defaults to the default account.
 
-        ``algorithm_plan`` is the payload get_algorithm_plan returned. Pass it back unchanged to
-        submit the proposal as-is, or edit it first. Everything not deliberately edited must
-        come back untouched: ``latest_prices`` and ``state`` are committed as given, not
-        recomputed. Submits immediately.
+        The account is the unit, not the algorithm: a broker reports one blended position per
+        symbol, so two algorithms trading the same account cannot be told apart here.
 
-        Only accepts bindings this agent drives -- switched on, with an empty ``cron``. Call
-        list_bindings to see which those are, and name ``binding_id`` when one algorithm is
-        bound to more than one account.
+        Carries ``equity``, ``cash``, ``day_pl`` (and percent), ``total_pl``, ``dividend_pl``
+        and the holdings in ``rows``. ``day_pl: null`` means the broker did not report where the
+        session started -- "unknown", not "flat". An unreachable broker fills ``error`` and
+        leaves the figures null rather than reporting zeros.
 
-        **Allocation strategies (Bursty DCA, Rally Rotation) -- edit ``intents``.** That list is
-        the complete intended action under ``mode: "target"``, so a held symbol dropped from it
-        is sold to zero. Orders are fitted to the account's available funds before submission,
-        so ``status`` distinguishes:
+        This is the same function the dashboard's account page calls, through the brokerage
+        interface, so every broker answers it the same way.
+        """
+        from src.api.payloads.accounts import positions_payload
+
+        return {"status": "ok", "updated_at": datetime.now(timezone.utc).isoformat(), **positions_payload(account_id)}
+
+    @mcp.tool()
+    def get_account_orders(account_id: str = "", limit: int = 40) -> dict[str, Any]:
+        """One account's recent orders, in every state, most recent first.
+
+        Filled, partially filled, replaced, cancelled, rejected and still-resting arrive in one
+        list -- a live order simply appears with a resting status and an unfilled quantity, so
+        there is no separate working-orders question to ask.
+
+        Capped at ``limit`` rather than windowed by time, which matters for good-till-cancelled
+        orders: a stop that has rested for two days is current exposure but was submitted long
+        ago, and any 24-hour window would drop it.
+
+        Same function the dashboard's account page calls. It reads the broker's own record where
+        the broker keeps one, so manual trades show up too; where it does not, it falls back to
+        the bot's order journal, and a row's ``status`` says which vocabulary you are reading.
+        """
+        from src.api.payloads.accounts import account_activity_payload
+
+        return {"status": "ok", **account_activity_payload(account_id, limit=limit)}
+
+    @mcp.tool()
+    def place_orders(plan_token: str, edits: list[dict[str, str]] | None = None) -> dict[str, Any]:
+        """Submit a reviewed plan. The response shape depends on the plan's own shape.
+
+        ``plan_token`` is the token get_algorithm_plan returned. The plan itself never travels
+        back: it is held here, so what executes is exactly what you reviewed. Submits
+        immediately. The token is single-use and expires in about ninety seconds -- if it has,
+        call get_algorithm_plan again rather than treating it as a failure.
+
+        **To decline a plan, do not call this tool.** That is the whole veto, and it needs no
+        argument. Say in your report what you declined and why.
+
+        ``edits`` is the narrower case: the plan is broadly right but one symbol is not, because
+        of something the algorithm could not see. Each edit is ``{"op": ..., "symbol": ...}``
+        and names an action, never an amount -- sizing stays the algorithm's:
+
+        - ``skip`` -- leave the symbol exactly as it is, neither bought nor sold today.
+        - ``exit`` -- close the position in that symbol.
+
+        Editing is refused for an order-book plan (Options Flip): a leg removed there cancels a
+        resting order rather than declining it, so that shape is submit-whole or decline-whole.
+        An edit naming a symbol the plan neither proposes nor holds is refused too, rather than
+        ignored, because that is nearly always a mistyped ticker.
+
+        The binding is the one the plan was computed against, re-checked here -- a binding
+        switched off between planning and submitting refuses, and so does the kill switch.
+
+        **Allocation strategies (Bursty DCA, Rally Rotation).** Orders are fitted to the
+        account's available funds before submission, so ``status`` distinguishes:
 
         - ``submitted`` -- every leg went out at the size asked for.
         - ``submitted_reduced`` -- the batch was deliberately trimmed to what the account can
@@ -294,21 +301,22 @@ def create_mcp_server(host: str = "0.0.0.0", port: int = 8001):
         ``funding`` explains how the batch was paid for -- buying power, the reserve held
         back, sale proceeds, and any cash-equivalent holdings liquidated to cover a shortfall.
 
-        **Options Flip -- edit ``desired_orders``, never ``intents`` (it is always empty for
-        this strategy).** Each entry is one resting order the algorithm wants at the broker
-        right now, keyed by role (``SYMBOL:entry`` / ``:target`` / ``:stop``). Missing or
-        dropping a key here is not "leave it as-is" -- reconciliation cancels whatever is not
-        in this list, so an edited payload missing a held position's ``:stop`` cancels that
-        stop at the broker. If you did not mean to touch a symbol, leave every one of its keys
-        exactly as returned. The response carries no ``funding``/``diff``: read
-        ``order_results`` (each entry ``submitted``/``replaced``/``cancelled``/``unchanged``/
-        ``rejected``, with the order id and reason where relevant) and ``working_orders`` (what
-        is now actually resting).
+        **Options Flip** proposes an order book instead. The response carries no
+        ``funding``/``diff``: read ``order_results`` (each entry ``submitted``/``replaced``/
+        ``cancelled``/``unchanged``/``rejected``, with the order id and reason where relevant)
+        and ``working_orders`` (what is now actually resting).
         """
-        plan = _plan_from_payload(algorithm_plan)
-        # Resolved from configuration, never from the payload: ``algorithm_plan`` is whatever
-        # the agent sent back, so the binding it claims cannot be the thing that authorises it.
-        binding, refusal = resolve_binding_for_origin(ORIGIN_MCP, binding_id=binding_id, strategy=plan.strategy)
+        try:
+            pending = claim(plan_token)
+        except PlanUnavailable as unavailable:
+            return {"status": "refused", "reason": unavailable.reason}
+        plan = pending.plan
+        # Re-resolved rather than trusted from the stash: a binding can be switched off, or
+        # handed to the scheduler, in the gap between proposing a plan and submitting it, and
+        # the authorisation that matters is the one in force now.
+        binding, refusal = resolve_binding_for_origin(
+            ORIGIN_MCP, binding_id=pending.binding_id, strategy=plan.strategy
+        )
         if binding is None:
             return {"strategy": plan.strategy, "status": "refused", "reason": refusal}
         # The binding's account, not the default one. get_config() with no account_id resolves
@@ -316,6 +324,18 @@ def create_mcp_server(host: str = "0.0.0.0", port: int = 8001):
         # orders submitted to a paper one -- or the reverse. The scheduler has always passed the
         # binding's account through run_once; this path simply never did.
         config = get_config(account_id=binding["account_id"] or None, strategy_id=plan.strategy)
+        # A plan's quantities are sized against one specific book's holdings and equity. If the
+        # binding has been repointed since it was proposed, those numbers describe an account
+        # this order would no longer reach.
+        if pending.account_id and pending.account_id != config.account_id:
+            return {
+                "strategy": plan.strategy,
+                "status": "refused",
+                "reason": (
+                    f"That plan was sized against {pending.account_id}, but {binding['id']} now "
+                    f"points at {config.account_id}. Call get_algorithm_plan again."
+                ),
+            }
 
         try:
             # Refused before authenticating: there is no point reaching a venue we have already
@@ -332,6 +352,14 @@ def create_mcp_server(host: str = "0.0.0.0", port: int = 8001):
             return {"strategy": plan.strategy, "status": "error", "reason": str(exc)}
 
         try:
+            # Applied here, against the live book rather than the one the plan was built on:
+            # ``skip`` means "leave this position where it is", and where it is now is the only
+            # honest reading of that.
+            plan, applied_edits = apply_edits(plan, edits, positions=brokerage.get_positions())
+        except PlanEditRefused as refused:
+            return {"strategy": plan.strategy, "status": "refused", "reason": refused.reason}
+
+        try:
             # The kill switch and the paper-only restriction are asserted inside, so this path
             # no longer has to remember them -- and can no longer forget one, which is how a
             # paper-only algorithm became executable against a live account from here.
@@ -344,7 +372,10 @@ def create_mcp_server(host: str = "0.0.0.0", port: int = 8001):
         # Journalled here as well as in the live runner: an agent-driven order is still
         # this algorithm's order, and the dashboard should not have a blind spot for it.
         record_orders(plan.strategy, config.account_id, outcome.get("order_results") or [])
-        return outcome
+        # Reported back even when empty: an outcome that shows only its final orders makes "the
+        # agent vetoed two symbols" read identically to "the algorithm proposed nothing", and
+        # those want very different follow-ups from whoever reads the wrap.
+        return {**outcome, "applied_edits": applied_edits}
 
     return mcp
 
