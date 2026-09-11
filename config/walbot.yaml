@@ -19,6 +19,7 @@ accounts:
     local_paper:
       label: Local Paper
       broker: paper
+      paper_starting_cash: 10000
 data_sources:
   intraday_market_data:
     provider_order:
