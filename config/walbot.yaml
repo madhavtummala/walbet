@@ -93,13 +93,13 @@ tradable_universe:
   - XSD
   - XYLD
 algorithm_bot:
-  trading_account_id: paper
+  trading_account_id: alpaca1
   strategy: bursty_dca
   backtest_period: 3m
   bindings:
   - id: b2
     strategy: bursty_dca
-    account_id: alpaca1
+    account_id: schwab1
     enabled: false
     cron: 0 11 * * 1-5
   - id: b4
@@ -109,7 +109,7 @@ algorithm_bot:
     cron: '*/30 10-15 * * 1-5'
   - id: b5
     strategy: options_flip
-    account_id: alpaca1
+    account_id: local_paper
     enabled: false
     cron: 2/10 10-15 * * 1-5
   enabled: false
